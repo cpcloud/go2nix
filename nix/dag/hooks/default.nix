@@ -38,9 +38,11 @@ in
   } ./compile-go-pkg.sh;
 
   # Hook for building and linking Go application binaries.
-  # Derivations using this hook must set:
-  #   env.linkManifestJSON — link manifest content (JSON string)
-  #   env.testManifestJSON — test manifest content (optional, when doCheck=true)
+  # Derivations using this hook set, as top-level attributes of a
+  # __structuredAttrs derivation (`env` keys work too, up to the size limit
+  # described at the application derivation in ../default.nix):
+  #   linkManifestJSON — link manifest content (JSON string)
+  #   testManifestJSON — test manifest content (optional, when doCheck=true)
   goAppHook = makeSetupHook {
     name = "go2nix-app-hook";
     propagatedBuildInputs = [

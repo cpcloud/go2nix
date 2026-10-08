@@ -1,7 +1,8 @@
 # shellcheck shell=bash
 # Atomic hook: link Go binaries via go2nix link-binary.
 #
-# Expected environment variables (set via derivation `env`):
+# Expected shell variables (top-level attributes of a __structuredAttrs
+# derivation, see ../default.nix):
 #   linkManifestJSON  — link manifest content (JSON string)
 #   testManifestJSON  — test manifest content (JSON string, only when doCheck=true)
 
