@@ -114,11 +114,36 @@ goEnv.buildGoApplication {
 packageOverrides = {
   "github.com/example/pkg" = {
     env = {
-      CGO_CFLAGS = "-I${libfoo.dev}/include";
+      CGO_CPPFLAGS = "-I${libfoo.dev}/include";
     };
   };
 };
 ```
+
+`CGO_CPPFLAGS`, `CGO_CFLAGS`, `CGO_CXXFLAGS`, `CGO_FFLAGS` and `CGO_LDFLAGS`
+mean what they mean to `go build`: they go ahead of the flags from the
+package's own `#cgo` lines and from `pkg-config`, and one that is unset or
+empty counts as `-O2 -g` (`CGO_CPPFLAGS` as empty). So a `CGO_CFLAGS` of your
+own replaces `-O2 -g` for that package's C code: put include paths and macros
+in `CGO_CPPFLAGS`, which also reaches C++ and Fortran files, and set
+`CGO_CFLAGS = "-O2"` to drop `-g`.
+
+The `#cgo CFLAGS`, `CPPFLAGS`, `CXXFLAGS`, `FFLAGS` and `LDFLAGS` lines of the
+sources need no override; their conditions (`#cgo linux`, a build tag) and
+`${SRCDIR}` work as they do under `go build`, with two exceptions: the
+experimental builder passes no tags to the compile step, and a local package's
+source holds its own directory only, so `-I${SRCDIR}/../include` finds nothing.
+
+`go build` refuses `#cgo` flags and `pkg-config` output that could make the
+compiler or the linker load or run something (`-fplugin=`, `-specs=`, `-B`,
+`-wrapper`, `-fuse-ld=`, `-Wa,…`, `-Xlinker`, `-Wl,--plugin`, `@file`, …)
+unless `CGO_CFLAGS_ALLOW`, `CGO_LDFLAGS_ALLOW` and friends permit them.
+`compile-package` passes on every flag go/build accepts, including those in a
+dependency's sources, and does not read the `CGO_*_ALLOW` and `CGO_*_DISALLOW`
+variables. What confines such a flag is the Nix sandbox: the build user,
+without network, writing the package's own output. With `sandbox = false`
+(the default on macOS) or `relaxed` it runs with the build user's access to
+the machine.
 
 `env` is default-mode only. The experimental builder synthesizes
 derivations at build time inside `go2nix resolve` and can only forward

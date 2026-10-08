@@ -106,6 +106,12 @@ go2nix compile-package --manifest FILE --import-path PATH --src-dir DIR --output
 | `--module-path` | No | Owning module's path; with `--module-version`, source paths are rewritten to `<module>@<version>/...` as `go build -trimpath` does |
 | `--module-version` | No | Owning module's version (from the `require` line); empty for main-module packages, which rewrite to the import path |
 
+For a cgo package it reads `CC`, `CXX` and `FC` (default `gcc`, `g++`,
+`gfortran`), `CGO_CPPFLAGS`, `CGO_CFLAGS`, `CGO_CXXFLAGS`, `CGO_FFLAGS` and
+`CGO_LDFLAGS` (see [Package Overrides](package-overrides.md#example-env)) and,
+through `pkg-config`, `PKG_CONFIG_PATH` from its environment, and adds the
+package's own `#cgo` lines to them as `go build` does.
+
 ### link-binary
 
 Link Go application binaries. Reads a link manifest that declares all

@@ -2,14 +2,14 @@ package compile
 
 import (
 	"fmt"
-	"go/ast"
-	"go/parser"
-	"go/token"
+	"go/build"
+	"io/fs"
 	"log/slog"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
 
 	"github.com/numtide/go2nix/pkg/gofiles"
@@ -34,35 +34,28 @@ func compileCgo(opts Options, files gofiles.PkgFiles, embedFlag string) error {
 	cc := envOrDefault("CC", "gcc")
 	cxx := envOrDefault("CXX", "g++")
 
-	// Read CGO flags from environment (Nix CC wrapper sets these when C libs are in nativeBuildInputs).
-	cgoCflags := strings.Fields(os.Getenv("CGO_CFLAGS"))
-	cgoCxxflags := strings.Fields(os.Getenv("CGO_CXXFLAGS"))
-	cgoLdflags := strings.Fields(os.Getenv("CGO_LDFLAGS"))
-
-	// Resolve #cgo pkg-config: directives from source files.
-	// go tool cgo does not process pkg-config directives; that's done by cmd/go.
-	// We handle it here so packages with #cgo pkg-config: work correctly.
-	pkgCflags, pkgLdflags, err := resolvePkgConfig(opts.SrcDir, files.CgoFiles, opts.goos, opts.goarch, opts.Tags)
+	// go tool cgo discards every #cgo line (cmd/cgo/gcc.go
+	// ProcessCgoDirectives): cmd/go is what turns the directives, the
+	// CGO_* environment and pkg-config into compiler and linker arguments.
+	pkg, err := cgoDirectives(opts, files.CgoFiles)
+	if err != nil {
+		return fmt.Errorf("#cgo directives: %w", err)
+	}
+	pcCflags, pcLdflags, err := pkgConfigFlags(pkg.CgoPkgConfig)
 	if err != nil {
 		return fmt.Errorf("pkg-config: %w", err)
 	}
-	cgoCflags = append(cgoCflags, pkgCflags...)
-	cgoLdflags = append(cgoLdflags, pkgLdflags...)
-
-	// Filter C++ standard library flags when no C++ sources are present.
-	if len(files.CXXFiles) == 0 {
-		cgoLdflags = filterCppFlags(cgoLdflags)
-	}
+	flags := newCgoFlags(pkg, pcCflags, pcLdflags)
 
 	// Support gfortran out of the box for Fortran files, matching cmd/go behavior.
 	if len(files.FFiles) > 0 {
 		fc := envOrDefault("FC", "gfortran")
 		if strings.Contains(fc, "gfortran") {
-			cgoLdflags = append(cgoLdflags, "-lgfortran")
+			flags.ld = append(flags.ld, "-lgfortran")
 		}
 	}
 
-	// Keep absolute build paths out of gcc/g++ object files. Mirrors
+	// Keep absolute build paths out of gcc/g++/gfortran object files. Mirrors
 	// cmd/go's compilerCmd (cmd/go/internal/work/exec.go:2484-2500): map
 	// the work dir to /tmp/go-build, and -gno-record-gcc-switches so the
 	// flag itself (which contains cgowork's random suffix) isn't recorded.
@@ -72,8 +65,11 @@ func compileCgo(opts Options, files gofiles.PkgFiles, embedFlag string) error {
 		"-ffile-prefix-map=" + opts.SrcDir + "=.",
 		"-gno-record-gcc-switches",
 	}
-	cgoCflags = append(slices.Clone(ccReproFlags), cgoCflags...)
-	cgoCxxflags = append(slices.Clone(ccReproFlags), cgoCxxflags...)
+	// CPPFLAGS go ahead of each language's own flags, and to every
+	// compiler (cmd/go/internal/work/exec.go:3053-3056).
+	cgoCflags := slices.Concat(ccReproFlags, flags.cpp, flags.c)
+	cgoCxxflags := slices.Concat(ccReproFlags, flags.cpp, flags.cxx)
+	cgoFflags := slices.Concat(ccReproFlags, flags.cpp, flags.f)
 
 	// Copy headers.
 	for _, h := range files.HFiles {
@@ -87,22 +83,32 @@ func compileCgo(opts Options, files gofiles.PkgFiles, embedFlag string) error {
 	}
 
 	// Step 1: go tool cgo.
-	// Pass CGO_CFLAGS after "--" so cgo's internal C compiler picks them up
-	// (needed for #cgo pkg-config: directives and explicit -I/-L flags).
+	// The C flags after "--" are for cgo's own runs of the C compiler. The
+	// linker flags go in -ldflags, which cgo writes to _cgo_gotypes.go as
+	// //go:cgo_ldflag directives for the final link; cgo would record
+	// $CGO_LDFLAGS a second time, so it is blanked
+	// (cmd/go/internal/work/exec.go:2990-3011).
 	cgoArgs := []string{
 		"tool", "cgo",
 		"-objdir", cgowork,
 		"-importpath", opts.PFlag,
-		"--",
-		"-I", cgowork,
 	}
+	if len(flags.ld) > 0 {
+		quoted := make([]string, len(flags.ld))
+		for i, f := range flags.ld {
+			quoted[i] = strconv.Quote(f)
+		}
+		cgoArgs = append(cgoArgs, "-ldflags="+strings.Join(quoted, " "))
+	}
+	cgoArgs = append(cgoArgs, "--", "-I", cgowork)
 	cgoArgs = append(cgoArgs, cgoCflags...)
 	cgoArgs = append(cgoArgs, files.CgoFiles...)
-	if err := runIn(opts.SrcDir, "go", cgoArgs...); err != nil {
+	if err := runInEnv(opts.SrcDir, []string{"CGO_LDFLAGS="}, "go", cgoArgs...); err != nil {
 		return fmt.Errorf("cgo: %w", err)
 	}
 
-	// Read _cgo_flags written by go tool cgo (contains LDFLAGS from #cgo directives).
+	// go tool cgo writes _cgo_flags only under -gccgo (cmd/cgo/out.go), so
+	// for the gc toolchain there is nothing to read here.
 	var cgoFlagsLDFLAGS []string
 	cgoFlagsFile := filepath.Join(cgowork, "_cgo_flags")
 	if data, err := os.ReadFile(cgoFlagsFile); err == nil {
@@ -113,10 +119,10 @@ func compileCgo(opts Options, files gofiles.PkgFiles, embedFlag string) error {
 		}
 	}
 
-	// Append pkg-config LDFLAGS to _cgo_flags so they propagate to the final
-	// link step via the packed archive.
-	if len(pkgLdflags) > 0 {
-		cgoFlagsLDFLAGS = append(cgoFlagsLDFLAGS, pkgLdflags...)
+	// Kept for now: the pkg-config LDFLAGS are written to _cgo_flags for the
+	// archive member below. They reach the final link through -ldflags above.
+	if len(pcLdflags) > 0 {
+		cgoFlagsLDFLAGS = append(cgoFlagsLDFLAGS, pcLdflags...)
 		allFlags := strings.Join(cgoFlagsLDFLAGS, " ")
 		if err := os.WriteFile(cgoFlagsFile, []byte("_CGO_LDFLAGS="+allFlags+"\n"), 0o644); err != nil {
 			return fmt.Errorf("writing _cgo_flags: %w", err)
@@ -139,7 +145,7 @@ func compileCgo(opts Options, files gofiles.PkgFiles, embedFlag string) error {
 	}
 
 	// Step 2: compile C/C++ files and .S/.sx assembly files with gcc.
-	compiledOFiles, err := compileCFiles(cc, cxx, cgowork, opts.SrcDir, uid, files, cgoCflags, cgoCxxflags, gccAsmFiles)
+	compiledOFiles, err := compileCFiles(cc, cxx, cgowork, opts.SrcDir, uid, files, cgoCflags, cgoCxxflags, cgoFflags, gccAsmFiles)
 	if err != nil {
 		return err
 	}
@@ -151,28 +157,12 @@ func compileCgo(opts Options, files gofiles.PkgFiles, embedFlag string) error {
 	if len(files.CXXFiles) > 0 || len(files.SwigCXXFiles) > 0 {
 		linker = cxx
 	}
-	dynFailObj, err := cgoTestLinkAndDynimport(cc, linker, cgowork, opts, uid, compiledOFiles, cgoFlagsLDFLAGS, cgoLdflags, cgoCflags)
+	dynFailObj, err := cgoTestLinkAndDynimport(cc, linker, cgowork, opts, uid, compiledOFiles, cgoFlagsLDFLAGS, flags.ld, cgoCflags, len(files.SysoFiles) > 0)
 	if err != nil {
 		return err
 	}
 	if dynFailObj != "" {
 		compiledOFiles = append(compiledOFiles, dynFailObj)
-	}
-
-	// Generate //go:cgo_ldflag directives so the linker picks up LDFLAGS.
-	// Normally cmd/go does this, but we invoke go tool cgo directly.
-	allLdflags := append(append([]string{}, cgoFlagsLDFLAGS...), cgoLdflags...)
-	if len(allLdflags) > 0 {
-		pkgName := extractPackageName(filepath.Join(cgowork, "_cgo_gotypes.go"))
-		ldflagFile := filepath.Join(cgowork, "_cgo_ldflag_"+uid+".go")
-		var sb strings.Builder
-		fmt.Fprintf(&sb, "package %s\n\n", pkgName)
-		for _, flag := range allLdflags {
-			fmt.Fprintf(&sb, "//go:cgo_ldflag %q\n", flag)
-		}
-		if err := os.WriteFile(ldflagFile, []byte(sb.String()), 0o644); err != nil {
-			return fmt.Errorf("writing cgo_ldflag: %w", err)
-		}
 	}
 
 	// Step 4a: if .s (Plan 9 assembly) files exist, generate symabis.
@@ -197,10 +187,6 @@ func compileCgo(opts Options, files gofiles.PkgFiles, embedFlag string) error {
 	dynImport := filepath.Join(cgowork, "_cgo_import_"+uid+".go")
 	if _, err := os.Stat(dynImport); err == nil {
 		cgoGoFiles = append(cgoGoFiles, dynImport)
-	}
-	ldflagFile := filepath.Join(cgowork, "_cgo_ldflag_"+uid+".go")
-	if _, err := os.Stat(ldflagFile); err == nil {
-		cgoGoFiles = append(cgoGoFiles, ldflagFile)
 	}
 
 	compileArgs := append(baseCompileArgs(opts), opts.outputFlags()...)
@@ -252,7 +238,9 @@ func compileCgo(opts Options, files gofiles.PkgFiles, embedFlag string) error {
 		return fmt.Errorf("pack: %w", err)
 	}
 
-	// Pack _cgo_flags into archive so LDFLAGS propagate to the final link step.
+	// Kept for now: cmd/link skips the _cgo_flags member
+	// (cmd/link/internal/ld/lib.go: a name under 16 bytes that does not end
+	// in .o or .syso).
 	if _, err := os.Stat(cgoFlagsFile); err == nil {
 		if err := packAppend(opts.Output, []string{cgoFlagsFile}); err != nil {
 			return fmt.Errorf("pack _cgo_flags: %w", err)
@@ -264,7 +252,7 @@ func compileCgo(opts Options, files gofiles.PkgFiles, embedFlag string) error {
 
 // compileCFiles compiles C, C++, and .S/.sx assembly files, returning object file paths.
 // Go .s files (Plan 9 assembly) are NOT handled here — they use go tool asm.
-func compileCFiles(cc, cxx, cgowork, srcDir, uid string, files gofiles.PkgFiles, cgoCflags, cgoCxxflags []string, gccAsmFiles []string) ([]string, error) {
+func compileCFiles(cc, cxx, cgowork, srcDir, uid string, files gofiles.PkgFiles, cgoCflags, cgoCxxflags, cgoFflags []string, gccAsmFiles []string) ([]string, error) {
 	var compiledOFiles []string
 
 	// Collect cgo-generated C files.
@@ -324,7 +312,6 @@ func compileCFiles(cc, cxx, cgowork, srcDir, uid string, files gofiles.PkgFiles,
 	// Compile Fortran files with FC (default: gfortran).
 	if len(files.FFiles) > 0 {
 		fc := envOrDefault("FC", "gfortran")
-		cgoFflags := strings.Fields(os.Getenv("CGO_FFLAGS"))
 		for _, f := range files.FFiles {
 			base := trimFileExt(filepath.Base(f))
 			oFile := filepath.Join(cgowork, base+"_f_"+uid+".o")
@@ -351,8 +338,11 @@ func compileCFiles(cc, cxx, cgowork, srcDir, uid string, files gofiles.PkgFiles,
 // "dynimportfail" marker that gets packed into the archive; cmd/link
 // recognises that member name and forces external linking (golang/go#52863;
 // cmd/go/internal/work/exec.go:3284, cmd/link/internal/ld/lib.go:1139).
-// The link's stderr is suppressed accordingly, matching cmd/go.
-func cgoTestLinkAndDynimport(cc, linker, cgowork string, opts Options, uid string, compiledOFiles, cgoFlagsLDFLAGS, cgoLdflags, cgoCflags []string) (string, error) {
+// cmd/go never shows the link's output. Here it is shown unless the
+// package has .syso files: without them the usual cause is a missing
+// library or flag, on which the application's link fails too, in another
+// derivation.
+func cgoTestLinkAndDynimport(cc, linker, cgowork string, opts Options, uid string, compiledOFiles, cgoFlagsLDFLAGS, cgoLdflags, cgoCflags []string, hasSyso bool) (string, error) {
 	cgoMainC := filepath.Join(cgowork, "_cgo_main.c")
 	if _, err := os.Stat(cgoMainC); err != nil {
 		return "", nil //nolint:nilerr // missing _cgo_main.c is expected, not an error
@@ -373,7 +363,12 @@ func cgoTestLinkAndDynimport(cc, linker, cgowork string, opts Options, uid strin
 	linkArgs = append(linkArgs, cgoLdflags...)
 	cmd := exec.Command(linker, linkArgs...)
 	if out, err := cmd.CombinedOutput(); err != nil {
-		slog.Debug("cgo test link failed; emitting dynimportfail marker", "err", err, "out", string(out))
+		if hasSyso {
+			slog.Debug("cgo test link failed; emitting dynimportfail marker", "err", err, "out", string(out))
+		} else {
+			slog.Warn("cgo test link failed; the package will need external linking", "pkg", opts.ImportPath, "err", err)
+			os.Stderr.Write(out) //nolint:errcheck
+		}
 		fail := filepath.Join(cgowork, "dynimportfail")
 		if werr := os.WriteFile(fail, nil, 0o644); werr != nil {
 			return "", werr
@@ -395,49 +390,68 @@ func cgoTestLinkAndDynimport(cc, linker, cgowork string, opts Options, uid strin
 	return "", nil
 }
 
-// filterCppFlags removes -lc++ and -lstdc++ from flags when no C++ sources
-// are present, avoiding unnecessary C++ standard library dependencies.
-func filterCppFlags(flags []string) []string {
-	out := make([]string, 0, len(flags))
-	for _, f := range flags {
-		if f != "-lc++" && f != "-lstdc++" {
-			out = append(out, f)
-		}
-	}
-	return out
+// cgoFlags holds a cgo package's CPPFLAGS, CFLAGS, CXXFLAGS, FFLAGS and
+// LDFLAGS.
+type cgoFlags struct {
+	cpp, c, cxx, f, ld []string
 }
 
-// resolvePkgConfig scans Go cgo source files for #cgo pkg-config: directives,
-// runs pkg-config to resolve them, and returns the resulting CFLAGS and LDFLAGS.
-// This is necessary because go tool cgo does not process pkg-config directives;
-// that processing is normally done by cmd/go (go build).
-func resolvePkgConfig(srcDir string, cgoFiles []string, goos, goarch string, tags []string) (cflags, ldflags []string, err error) {
-	var pkgNames []string
+// defaultCFlags is cmd/go's work.DefaultCFlags: what CGO_CFLAGS,
+// CGO_CXXFLAGS, CGO_FFLAGS and CGO_LDFLAGS stand for when unset or empty.
+const defaultCFlags = "-O2 -g"
 
-	for _, f := range cgoFiles {
-		preamble := cgoPreamble(filepath.Join(srcDir, f))
-		for _, line := range strings.Split(preamble, "\n") {
-			line = strings.TrimSpace(line)
-			if !strings.HasPrefix(line, "#cgo ") {
-				continue
-			}
-			line = strings.TrimPrefix(line, "#cgo ")
-			line = strings.TrimSpace(line)
-
-			// Check for platform constraint before "pkg-config:".
-			if idx := strings.Index(line, "pkg-config:"); idx >= 0 {
-				constraint := strings.TrimSpace(line[:idx])
-				if constraint != "" && !matchesCgoConstraint(constraint, goos, goarch, tags) {
-					continue
-				}
-				pkgs := strings.TrimSpace(line[idx+len("pkg-config:"):])
-				if pkgs != "" {
-					pkgNames = append(pkgNames, strings.Fields(pkgs)...)
-				}
-			}
+// newCgoFlags mirrors Builder.CFlags and the flag handling of runCgo
+// (cmd/go/internal/work/exec.go): the CGO_* environment or its default
+// first, then the package's #cgo directives, then pkg-config, whose
+// --cflags go to CPPFLAGS and whose --libs go to LDFLAGS.
+func newCgoFlags(pkg *build.Package, pcCflags, pcLdflags []string) cgoFlags {
+	env := func(name, def string) []string {
+		v := os.Getenv("CGO_" + name)
+		if v == "" {
+			v = def
 		}
+		return strings.Fields(v)
 	}
+	return cgoFlags{
+		cpp: slices.Concat(env("CPPFLAGS", ""), pkg.CgoCPPFLAGS, pcCflags),
+		c:   slices.Concat(env("CFLAGS", defaultCFlags), pkg.CgoCFLAGS),
+		cxx: slices.Concat(env("CXXFLAGS", defaultCFlags), pkg.CgoCXXFLAGS),
+		f:   slices.Concat(env("FFLAGS", defaultCFlags), pkg.CgoFFLAGS),
+		ld:  slices.Concat(env("LDFLAGS", defaultCFlags), pkg.CgoLDFLAGS, pcLdflags),
+	}
+}
 
+// cgoDirectives returns the #cgo directives of cgoFiles (the Cgo* fields of
+// the result) as go/build parses them for cmd/go: conditions evaluated,
+// ${SRCDIR} expanded to opts.SrcDir, relative -I and -L paths made absolute.
+// The context is the one the files were selected with.
+func cgoDirectives(opts Options, cgoFiles []string) (*build.Package, error) {
+	ctx := gofiles.BuildContext(strings.Join(opts.Tags, ","), ToolchainVersion())
+	ctx.GOOS, ctx.GOARCH = opts.goos, opts.goarch
+	// CgoFiles are only listed with cgo enabled.
+	ctx.CgoEnabled = true
+	// File names and //go:build lines were evaluated when the files were
+	// listed; go/build sees those files and no others.
+	ctx.UseAllFiles = true
+	ctx.ReadDir = func(dir string) ([]fs.FileInfo, error) {
+		infos := make([]fs.FileInfo, 0, len(cgoFiles))
+		for _, f := range cgoFiles {
+			fi, err := os.Stat(filepath.Join(dir, f))
+			if err != nil {
+				return nil, err
+			}
+			infos = append(infos, fi)
+		}
+		// The order of os.ReadDir, in which cmd/go concatenates the flags.
+		slices.SortFunc(infos, func(a, b fs.FileInfo) int { return strings.Compare(a.Name(), b.Name()) })
+		return infos, nil
+	}
+	return ctx.ImportDir(opts.SrcDir, 0)
+}
+
+// pkgConfigFlags runs pkg-config on the arguments of the package's
+// #cgo pkg-config: directives and returns the resulting CFLAGS and LDFLAGS.
+func pkgConfigFlags(pkgNames []string) (cflags, ldflags []string, err error) {
 	if len(pkgNames) == 0 {
 		return nil, nil, nil
 	}
@@ -461,34 +475,15 @@ func resolvePkgConfig(srcDir string, cgoFiles []string, goos, goarch string, tag
 	return cflags, ldflags, nil
 }
 
-// cgoPreamble returns the cgo preamble text (the doc comment on import "C")
-// from a Go source file. Returns "" if the file can't be parsed or has no
-// import "C". Uses go/parser, matching cmd/go's approach.
-func cgoPreamble(path string) string {
-	fset := token.NewFileSet()
-	f, err := parser.ParseFile(fset, path, nil, parser.ImportsOnly|parser.ParseComments)
-	if err != nil {
-		return ""
-	}
-	for _, decl := range f.Decls {
-		d, ok := decl.(*ast.GenDecl)
-		if !ok || d.Tok != token.IMPORT {
-			continue
-		}
-		for _, spec := range d.Specs {
-			s, ok := spec.(*ast.ImportSpec)
-			if !ok || s.Path.Value != `"C"` {
-				continue
-			}
-			if s.Doc != nil {
-				return s.Doc.Text()
-			}
-			if d.Doc != nil {
-				return d.Doc.Text()
-			}
-		}
-	}
-	return ""
+// runInEnv is runIn with env added to the inherited environment.
+func runInEnv(dir string, env []string, name string, args ...string) error {
+	slog.Debug("exec", "cmd", name, "args", args, "dir", dir, "env", env)
+	cmd := exec.Command(name, args...)
+	cmd.Dir = dir
+	cmd.Env = append(os.Environ(), env...)
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	return cmd.Run()
 }
 
 // trimFileExt removes the file extension from a filename.
@@ -497,75 +492,4 @@ func trimFileExt(name string) string {
 		return strings.TrimSuffix(name, ext)
 	}
 	return name
-}
-
-// unixOS is the set of GOOS values for which the build tag "unix" is
-// satisfied, mirroring go/build's unixOS map.
-var unixOS = map[string]bool{
-	"aix": true, "android": true, "darwin": true, "dragonfly": true,
-	"freebsd": true, "hurd": true, "illumos": true, "ios": true,
-	"linux": true, "netbsd": true, "openbsd": true, "solaris": true,
-}
-
-// matchesCgoConstraint checks if a #cgo constraint matches the current build
-// target. The syntax (per cmd/cgo and go/build.matchAuto) is a
-// space-separated OR of comma-separated AND terms; each term may be a GOOS,
-// GOARCH, "unix", "cgo", "gc"/"gccgo", or any active build tag, optionally
-// negated with a leading '!'. Examples:
-//
-//	"linux,amd64 darwin"  → (linux AND amd64) OR darwin
-//	"!windows"            → NOT windows
-//	"mytag"               → satisfied iff -tags=mytag is set
-func matchesCgoConstraint(constraint, goos, goarch string, tags []string) bool {
-	groups := strings.Fields(constraint)
-	if len(groups) == 0 {
-		return true
-	}
-	for _, group := range groups {
-		if matchCgoGroup(group, goos, goarch, tags) {
-			return true
-		}
-	}
-	return false
-}
-
-// matchCgoGroup evaluates one comma-separated AND group.
-func matchCgoGroup(group, goos, goarch string, tags []string) bool {
-	for _, term := range strings.Split(group, ",") {
-		if term == "" {
-			// Empty term (e.g., trailing comma) makes the group fail,
-			// matching go/build.matchTag("").
-			return false
-		}
-		negate := false
-		if strings.HasPrefix(term, "!") {
-			negate = true
-			term = term[1:]
-			if term == "" {
-				return false // "!" alone is a syntax error → no match
-			}
-		}
-		match := matchCgoTerm(term, goos, goarch, tags)
-		if negate {
-			match = !match
-		}
-		if !match {
-			return false
-		}
-	}
-	return true
-}
-
-// matchCgoTerm reports whether a single constraint term is satisfied.
-func matchCgoTerm(term, goos, goarch string, tags []string) bool {
-	switch term {
-	case goos, goarch:
-		return true
-	case "unix":
-		return unixOS[goos]
-	case "cgo", "gc":
-		// We are the gc toolchain compiling a cgo package.
-		return true
-	}
-	return slices.Contains(tags, term)
 }
