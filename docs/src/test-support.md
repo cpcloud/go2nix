@@ -53,6 +53,11 @@ Each testable package goes through these steps:
 1. **Link and run** — the test binary is linked and executed in the package's
    source directory.
 
+All of these compiles get the `-lang` of the `go` line of the module the
+package belongs to (a sibling module's own, behind a filesystem `replace`),
+like the package's own derivation: a module that says `go 1.21` is tested
+with the loop-variable semantics it ships with.
+
 ### Internal tests vs external tests (xtests)
 
 Go has two kinds of test files, both supported:

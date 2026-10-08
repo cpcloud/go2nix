@@ -108,6 +108,9 @@ func Run(opts Options) error {
 	}
 	slog.Info("testable packages", "count", len(testable), "skipped", skipped)
 
+	// Before the overlays: one moves SrcDir to a copy outside the module.
+	goVersions := langVersions(pkgs, inScope)
+
 	// Resolve //go:embed patterns now, only for packages in scope. Doing this
 	// after the LocalArchives filter means an out-of-scope package whose
 	// embed targets are absent from mainSrc (e.g. supplied at build time
@@ -130,11 +133,25 @@ func Run(opts Options) error {
 	}
 
 	for _, p := range testable {
-		if err := runPackageTests(opts, modulePath, p, pkgMap); err != nil {
+		if err := runPackageTests(opts, modulePath, p, pkgMap, goVersions); err != nil {
 			return fmt.Errorf("testing %s: %w", p.ImportPath, err)
 		}
 	}
 	return nil
+}
+
+// langVersions returns, per in-scope import path, the go line of the go.mod
+// above the package's directory, which is the package's own module also for
+// a sibling behind a filesystem replace: mainSrc carries go.mod at modRoot
+// and at every replace target.
+func langVersions(pkgs []*localpkgs.LocalPkg, inScope func(string) bool) map[string]string {
+	versions := make(map[string]string)
+	for _, p := range pkgs {
+		if inScope(p.ImportPath) {
+			versions[p.ImportPath] = compile.FindGoVersion(p.SrcDir)
+		}
+	}
+	return versions
 }
 
 // applySrcOverlay layers the packageOverrides.<pkg>.srcOverlay derivation
@@ -236,7 +253,13 @@ func affectedLocalDeps(targetPkg string, xtestLocalImports []string, pkgMap map[
 	})
 }
 
-func runPackageTests(opts Options, modulePath string, pkg *localpkgs.LocalPkg, pkgMap map[string]*localpkgs.LocalPkg) error {
+// runPackageTests builds and runs the test binary of pkg. goVersions holds,
+// per import path, the go line of the go.mod above the package: cmd/go
+// compiles ptest, pxtest and pmain with the -lang of the module of the
+// package under test, and a recompiled dependent with its own
+// (cmd/go/internal/work/gc.go:68-80; load.TestPackagesAndErrors keeps
+// Module: p.Module).
+func runPackageTests(opts Options, modulePath string, pkg *localpkgs.LocalPkg, pkgMap map[string]*localpkgs.LocalPkg, goVersions map[string]string) error {
 	slog.Info("testing", "pkg", pkg.ImportPath)
 
 	testDir := filepath.Join(opts.TrimPath, "test-"+sanitize(pkg.ImportPath))
@@ -298,6 +321,7 @@ func runPackageTests(opts Options, modulePath string, pkg *localpkgs.LocalPkg, p
 			SrcDir:      pkg.SrcDir,
 			Output:      internalArchive,
 			ImportCfg:   testCompileImportCfg,
+			GoVersion:   goVersions[pkg.ImportPath],
 			TrimPath:    opts.TrimPath,
 			GCFlagsList: opts.GCFlagsList,
 			Tags:        opts.tagsList(),
@@ -346,6 +370,7 @@ func runPackageTests(opts Options, modulePath string, pkg *localpkgs.LocalPkg, p
 				SrcDir:      depPkg.SrcDir,
 				Output:      recompArchive,
 				ImportCfg:   testCompileImportCfg,
+				GoVersion:   goVersions[depIP],
 				TrimPath:    opts.TrimPath,
 				GCFlagsList: opts.GCFlagsList,
 				Tags:        opts.tagsList(),
@@ -369,6 +394,7 @@ func runPackageTests(opts Options, modulePath string, pkg *localpkgs.LocalPkg, p
 			SrcDir:      pkg.SrcDir,
 			Output:      externalArchive,
 			ImportCfg:   testCompileImportCfg,
+			GoVersion:   goVersions[pkg.ImportPath],
 			TrimPath:    opts.TrimPath,
 			GCFlagsList: opts.GCFlagsList,
 			Tags:        opts.tagsList(),
@@ -415,6 +441,7 @@ func runPackageTests(opts Options, modulePath string, pkg *localpkgs.LocalPkg, p
 		SrcDir:      testDir,
 		Output:      testMainArchive,
 		ImportCfg:   testCompileImportCfg,
+		GoVersion:   goVersions[pkg.ImportPath],
 		TrimPath:    opts.TrimPath,
 		GCFlagsList: opts.GCFlagsList,
 		Tags:        opts.tagsList(),

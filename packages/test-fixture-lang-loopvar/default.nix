@@ -2,7 +2,9 @@
 #
 # Builds tests/fixtures/lang-loopvar (go 1.21) under the dag builder and
 # runs the binary, which asserts pre-1.22 shared-loopvar semantics in a
-# non-root subpackage. Requires recursive-nix.
+# non-root subpackage; the tests of that subpackage assert the same of the
+# archives the test runner compiles, and the fixture's check phase that they
+# ran. Requires recursive-nix.
 {
   flake,
   pkgs,

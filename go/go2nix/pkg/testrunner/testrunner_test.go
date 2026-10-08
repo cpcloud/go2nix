@@ -114,6 +114,39 @@ func TestInternalTestPkgFiles(t *testing.T) {
 	}
 }
 
+func TestLangVersions(t *testing.T) {
+	root := t.TempDir()
+	write := func(rel, content string) {
+		t.Helper()
+		path := filepath.Join(root, rel)
+		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	write("app/go.mod", "module example.com/app\n\ngo 1.21\n")
+	write("app/internal/a/a.go", "package a\n")
+	write("app/internal/skipped/s.go", "package skipped\n")
+	write("sib/go.mod", "module example.com/sib\n\ngo 1.20.3\n")
+	write("sib/util/u.go", "package util\n")
+
+	pkgs := []*localpkgs.LocalPkg{
+		{ImportPath: "example.com/app/internal/a", SrcDir: filepath.Join(root, "app/internal/a")},
+		{ImportPath: "example.com/app/internal/skipped", SrcDir: filepath.Join(root, "app/internal/skipped")},
+		{ImportPath: "example.com/sib/util", SrcDir: filepath.Join(root, "sib/util")},
+	}
+	got := langVersions(pkgs, func(ip string) bool { return ip != "example.com/app/internal/skipped" })
+	want := map[string]string{
+		"example.com/app/internal/a": "1.21",
+		"example.com/sib/util":       "1.20",
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("langVersions = %v, want %v", got, want)
+	}
+}
+
 func TestApplySrcOverlay(t *testing.T) {
 	srcDir := t.TempDir()
 	overlay := t.TempDir()

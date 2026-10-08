@@ -158,6 +158,14 @@ func CompileGoPackage(opts Options) error {
 	return compileGo(opts, files, embedFlag)
 }
 
+// FindGoVersion returns the -lang version CompileGoPackage picks for sources
+// in dir when Options.GoVersion is empty: the go line of the go.mod above
+// dir. A caller that compiles a package from a copy of its directory calls
+// it on the original and passes the result as Options.GoVersion.
+func FindGoVersion(dir string) string {
+	return findGoVersion(dir)
+}
+
 // baseCompileArgs returns the flags common to every `go tool compile`
 // invocation. -nolocalimports mirrors cmd/go (work/gc.go:137-141): the
 // alternative -D LocalPrefix branch only applies to legacy GOPATH-style
