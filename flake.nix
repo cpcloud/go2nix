@@ -139,6 +139,9 @@
           test-fixture-modroot-dotslash = callPkgWith ./tests/nix/modroot_dotslash_test.nix {
             inherit flake system;
           };
+          test-fixture-large-manifest = callPkgWith ./tests/nix/large_manifest_test.nix {
+            inherit flake system;
+          };
           test-fixture-mainsrc-precise = callPkgWith ./packages/test-fixture-mainsrc-precise/default.nix {
             inherit flake system;
           };
