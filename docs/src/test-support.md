@@ -50,8 +50,10 @@ Each testable package goes through these steps:
    test archive.
 1. **Test main generation** — a `_testmain.go` is generated that registers
    all `Test*`, `Benchmark*`, `Fuzz*`, and `Example*` functions.
-1. **Link and run** — the test binary is linked and executed in the package's
-   source directory.
+1. **Link and run** — the test binary is linked, with `$CXX` as the external
+   linker when a package of the build (test-only dependencies included) has
+   C++ sources and `$CC` otherwise, and executed in the package's source
+   directory.
 
 All of these compiles get the `-lang` of the `go` line of the module the
 package belongs to (a sibling module's own, behind a filesystem `replace`),

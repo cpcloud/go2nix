@@ -48,6 +48,9 @@ type Options struct {
 	// overlay any in-closure srcOverlay package fails embed resolution
 	// (or, with placeholders present, observes source-tree content).
 	SrcOverlays map[string]string
+	// CXX selects $CXX instead of $CC as the external linker of the test
+	// binaries (TestManifest.CXX).
+	CXX bool
 }
 
 func (o Options) checkFlagsArgs() []string {
@@ -460,6 +463,7 @@ func runPackageTests(opts Options, modulePath string, pkg *localpkgs.LocalPkg, p
 	// matter. Using `go tool link` matches how compile uses `go tool compile`.
 	linkArgs := []string{
 		"tool", "link",
+		"-extld", externalLinker(opts.CXX),
 		"-buildid=redacted",
 		"-importcfg", testImportCfg,
 		"-o", testBin,
@@ -546,6 +550,19 @@ func overrideImportCfgEntry(importCfgPath, importPath, archivePath string) error
 	lines = append(lines, fmt.Sprintf("packagefile %s=%s", importPath, archivePath))
 
 	return os.WriteFile(importCfgPath, []byte(strings.Join(lines, "\n")+"\n"), 0o644)
+}
+
+// externalLinker is cmd/go's choice of -extld, which it always passes: $CXX
+// when a linked package has C++ sources and $CC otherwise, each with the
+// toolchain's own default when unset (cmd/go/internal/work/gc.go:591-595,
+// 632-644; link-binary chooses the same way from LinkSubPackage.CXX). Left
+// alone, cmd/link runs its platform default ("gcc", "clang" on darwin), which
+// links no C++ runtime and need not be on PATH.
+func externalLinker(cxx bool) string {
+	if cxx {
+		return compile.GoEnvVar("CXX")
+	}
+	return compile.GoEnvVar("CC")
 }
 
 func sanitize(s string) string {

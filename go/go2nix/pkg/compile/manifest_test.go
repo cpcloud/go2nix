@@ -294,6 +294,25 @@ func TestLoadTestManifest(t *testing.T) {
 	}
 }
 
+func TestLoadTestManifest_cxx(t *testing.T) {
+	for json, want := range map[string]bool{
+		`{"version":2,"kind":"test","importcfgParts":[],"localArchives":{},"moduleRoot":"/src","tags":[],"gcflags":[],"checkFlags":[]}`:            false,
+		`{"version":2,"kind":"test","importcfgParts":[],"localArchives":{},"moduleRoot":"/src","tags":[],"gcflags":[],"checkFlags":[],"cxx":true}`: true,
+	} {
+		path := filepath.Join(t.TempDir(), "manifest.json")
+		if err := os.WriteFile(path, []byte(json), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		m, err := LoadTestManifest(path)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if m.CXX != want {
+			t.Errorf("CXX = %v, want %v for %s", m.CXX, want, json)
+		}
+	}
+}
+
 func TestLoadLinkManifest(t *testing.T) {
 	tests := []struct {
 		name    string

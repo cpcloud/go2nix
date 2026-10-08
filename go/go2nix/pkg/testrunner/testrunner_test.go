@@ -248,6 +248,17 @@ func TestApplySrcOverlay(t *testing.T) {
 	}
 }
 
+func TestExternalLinker(t *testing.T) {
+	t.Setenv("CC", "the-cc")
+	t.Setenv("CXX", "the-cxx")
+	if got := externalLinker(false); got != "the-cc" {
+		t.Errorf("externalLinker(false) = %q, want $CC", got)
+	}
+	if got := externalLinker(true); got != "the-cxx" {
+		t.Errorf("externalLinker(true) = %q, want $CXX", got)
+	}
+}
+
 func TestSanitize(t *testing.T) {
 	tests := []struct {
 		input, want string
