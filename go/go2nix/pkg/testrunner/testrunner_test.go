@@ -4,6 +4,8 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"slices"
+	"strings"
 	"testing"
 
 	"github.com/numtide/go2nix/pkg/gofiles"
@@ -65,6 +67,50 @@ func TestOverrideImportCfgEntry(t *testing.T) {
 				t.Errorf("got:\n%s\nwant:\n%s", got, tt.want)
 			}
 		})
+	}
+}
+
+func TestTestLinkFlags(t *testing.T) {
+	root := t.TempDir()
+	for name, src := range map[string]string{
+		"old/go.mod":      "module example.com/old\n\ngo 1.21\n",
+		"old/p/p.go":      "package p\n",
+		"old/p/p_test.go": "//go:debug panicnil=1\npackage p\n",
+		"new/go.mod":      "module example.com/new\n\ngo 1.99\n",
+		"new/p/p.go":      "package p\n",
+	} {
+		path := filepath.Join(root, name)
+		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, []byte(src), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	t.Setenv("GOFIPS140", "")
+
+	// go 1.21: httpmuxgo121=1 is a default with every toolchain from 1.22 on;
+	// panicnil=1 comes from the _test.go file only.
+	got := testLinkFlags(Options{ModuleRoot: filepath.Join(root, "old")},
+		&localpkgs.LocalPkg{SrcDir: filepath.Join(root, "old/p")})
+	if len(got) != 3 || got[0] != "-X" || got[1] != "testing.testBinary=1" {
+		t.Fatalf("testLinkFlags = %v, want -X testing.testBinary=1 and one more flag", got)
+	}
+	godebug, ok := strings.CutPrefix(got[2], "-X=runtime.godebugDefault=")
+	if !ok {
+		t.Fatalf("testLinkFlags[2] = %q, want -X=runtime.godebugDefault=...", got[2])
+	}
+	for _, want := range []string{"httpmuxgo121=1", "panicnil=1"} {
+		if !slices.Contains(strings.Split(godebug, ","), want) {
+			t.Errorf("default GODEBUG %q lacks %s", godebug, want)
+		}
+	}
+
+	// Nothing to default for a module newer than every table entry.
+	got = testLinkFlags(Options{ModuleRoot: filepath.Join(root, "new")},
+		&localpkgs.LocalPkg{SrcDir: filepath.Join(root, "new/p")})
+	if want := []string{"-X", "testing.testBinary=1"}; !reflect.DeepEqual(got, want) {
+		t.Errorf("testLinkFlags = %v, want %v", got, want)
 	}
 }
 

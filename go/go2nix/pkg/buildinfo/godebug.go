@@ -57,6 +57,18 @@ func ParseGoDebug(text string) (key, value string, err error) {
 // uses (Package.Directives). Directives that fail ParseGoDebug are skipped,
 // matching cmd/go/internal/load.defaultGODEBUG.
 func ParseSourceGodebugs(ctx *build.Context, srcDir string) []Godebug {
+	return parseGodebugs(ctx, srcDir, false)
+}
+
+// ParseTestGodebugs is ParseSourceGodebugs for the test binary of the
+// package at srcDir: the package's own directives, then those of its
+// _test.go files and of its external test package, the order in which
+// cmd/go/internal/load.TestPackagesAndErrors hands them to defaultGODEBUG.
+func ParseTestGodebugs(ctx *build.Context, srcDir string) []Godebug {
+	return parseGodebugs(ctx, srcDir, true)
+}
+
+func parseGodebugs(ctx *build.Context, srcDir string, test bool) []Godebug {
 	if ctx == nil {
 		c := build.Default
 		ctx = &c
@@ -65,13 +77,19 @@ func ParseSourceGodebugs(ctx *build.Context, srcDir string) []Godebug {
 	if err != nil && pkg == nil {
 		return nil
 	}
+	lists := [][]build.Directive{pkg.Directives}
+	if test {
+		lists = append(lists, pkg.TestDirectives, pkg.XTestDirectives)
+	}
 	var out []Godebug
-	for _, d := range pkg.Directives {
-		k, v, perr := ParseGoDebug(d.Text)
-		if perr != nil {
-			continue
+	for _, list := range lists {
+		for _, d := range list {
+			k, v, perr := ParseGoDebug(d.Text)
+			if perr != nil {
+				continue
+			}
+			out = append(out, Godebug{Key: k, Value: v})
 		}
-		out = append(out, Godebug{Key: k, Value: v})
 	}
 	return out
 }

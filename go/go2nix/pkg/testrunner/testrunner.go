@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"strings"
 
+	"github.com/numtide/go2nix/pkg/buildinfo"
 	"github.com/numtide/go2nix/pkg/compile"
 	"github.com/numtide/go2nix/pkg/gofiles"
 	"github.com/numtide/go2nix/pkg/localpkgs"
@@ -462,8 +463,9 @@ func runPackageTests(opts Options, modulePath string, pkg *localpkgs.LocalPkg, p
 		"-buildid=redacted",
 		"-importcfg", testImportCfg,
 		"-o", testBin,
-		testMainArchive,
 	}
+	linkArgs = append(linkArgs, testLinkFlags(opts, pkg)...)
+	linkArgs = append(linkArgs, testMainArchive)
 	cmd := exec.Command("go", linkArgs...)
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
@@ -503,6 +505,24 @@ func internalTestPkgFiles(pkg *localpkgs.LocalPkg, embedCfg *gofiles.EmbedCfg) g
 		SysoFiles: pkg.SysoFiles,
 		EmbedCfg:  embedCfg,
 	}
+}
+
+// testLinkFlags returns the flags cmd/go adds to the link of pkg's test
+// binary: -X testing.testBinary=1, which is what testing.Testing reads, and
+// the default GODEBUG (cmd/go/internal/load.TestPackagesAndErrors,
+// work.gcToolchain.ld). The latter comes from the main module's go.mod, like
+// the application's in link-binary and also for a package of a sibling
+// module (defaultGODEBUG reads MainModules), and from the //go:debug lines
+// of the package and of its tests.
+func testLinkFlags(opts Options, pkg *localpkgs.LocalPkg) []string {
+	flags := []string{"-X", "testing.testBinary=1"}
+	bctx := gofiles.BuildContext(opts.Tags, compile.ToolchainVersion())
+	godebugDefault := buildinfo.DefaultGODEBUG(opts.ModuleRoot,
+		buildinfo.ParseTestGodebugs(&bctx, pkg.SrcDir), os.Getenv("GOFIPS140"), compile.ToolchainVersion(), compile.GoEnvVar("GOROOT"))
+	if godebugDefault != "" {
+		flags = append(flags, "-X=runtime.godebugDefault="+godebugDefault)
+	}
+	return flags
 }
 
 // overrideImportCfgEntry rewrites the importcfg file, replacing (or adding)

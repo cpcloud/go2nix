@@ -175,5 +175,10 @@ rewrites and the binary rejects them.
   in [`extraMainSrcFiles`](#extramainsrcfiles).
 - **No `go test` extras.** No coverage instrumentation, no `vet` pass, no
   default 10-minute timeout, and packages are tested one after another.
-- **`ldflags` do not reach test binaries**; they are linked with the
-  importcfg only.
+- **`ldflags` do not reach test binaries.** On its own the test link adds
+  what `go test` adds: `-X testing.testBinary=1`, which makes
+  `testing.Testing()` true, and the default `GODEBUG` the application gets
+  from the main module's `go.mod`, extended with the `//go:debug` lines of
+  the package, of its `_test.go` files and of its external test package.
+- **No build info in test binaries.** `debug.ReadBuildInfo()` reports
+  `ok == false` inside a test.
