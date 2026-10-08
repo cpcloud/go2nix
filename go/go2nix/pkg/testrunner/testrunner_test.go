@@ -273,3 +273,18 @@ func TestSanitize(t *testing.T) {
 		}
 	}
 }
+
+func TestTestBinaryArgs(t *testing.T) {
+	if got, want := testBinaryArgs(nil), []string{"-test.paniconexit0"}; !reflect.DeepEqual(got, want) {
+		t.Errorf("testBinaryArgs(nil) = %v, want %v", got, want)
+	}
+	checkFlags := []string{"-test.v", "-test.run", "X"}
+	got := testBinaryArgs(checkFlags)
+	want := []string{"-test.paniconexit0", "-test.v", "-test.run", "X"}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("testBinaryArgs = %v, want %v", got, want)
+	}
+	if !reflect.DeepEqual(checkFlags, []string{"-test.v", "-test.run", "X"}) {
+		t.Errorf("checkFlags modified: %v", checkFlags)
+	}
+}

@@ -141,6 +141,9 @@
           test-fixture-testmain-badsig = callPkgWith ./tests/nix/testmain_badsig_test.nix {
             inherit flake system;
           };
+          test-fixture-test-exit-zero = callPkgWith ./tests/nix/test_exit_zero_test.nix {
+            inherit flake system;
+          };
           test-fixture-mainsrc-replace = callPkgWith ./tests/nix/mainsrc_replace_test.nix {
             inherit flake system;
           };

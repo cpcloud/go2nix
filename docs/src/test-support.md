@@ -161,6 +161,11 @@ The flags are handed to the test binary as they are, so they take the
 `-test.bench`, `-test.timeout`. The short forms (`-v`, `-run`) are `go test`
 rewrites and the binary rejects them.
 
+Ahead of them the binary always gets `-test.paniconexit0`, as it does from
+`go test`: a test, or code it calls, that reaches `os.Exit(0)` fails the
+package with `unexpected call to os.Exit(0) during test` instead of ending
+the run early with the exit status of a pass.
+
 ## Limitations
 
 - **Default mode only.** The experimental builder does not run tests.

@@ -478,7 +478,7 @@ func runPackageTests(opts Options, modulePath string, pkg *localpkgs.LocalPkg, p
 	}
 
 	// Step 6: Run tests
-	testArgs := opts.checkFlagsArgs()
+	testArgs := testBinaryArgs(opts.checkFlagsArgs())
 	testCmd := exec.Command(testBin, testArgs...)
 	testCmd.Dir = pkg.SrcDir
 	testCmd.Stdout = os.Stdout
@@ -567,6 +567,15 @@ func externalLinker(cxx bool) string {
 
 func sanitize(s string) string {
 	return strings.NewReplacer("/", "_", ".", "_").Replace(s)
+}
+
+// testBinaryArgs returns the arguments a test binary is started with. cmd/go
+// puts -test.paniconexit0 ahead of the user's flags
+// (cmd/go/internal/test.runTestActor.Act): package testing then turns an
+// os.Exit(0) reached while tests run into a panic, where the process would
+// otherwise end with the status of a passing run.
+func testBinaryArgs(checkFlags []string) []string {
+	return append([]string{"-test.paniconexit0"}, checkFlags...)
 }
 
 func copyFile(src, dst string) error {
