@@ -79,26 +79,10 @@ func runTestPackagesCmd(args []string) {
 		}
 	}
 
-	// Reconstruct local-pkgs directory from manifest's localArchives map.
-	localPkgsDir := filepath.Join(tmpDir, "local-pkgs")
-	for importPath, archivePath := range m.LocalArchives {
-		dir := filepath.Join(localPkgsDir, filepath.Dir(importPath))
-		if err := os.MkdirAll(dir, 0o755); err != nil {
-			slog.Error("test-packages: failed to create local-pkgs dir", "err", err)
-			os.Exit(1)
-		}
-		dst := filepath.Join(localPkgsDir, importPath+".a")
-		if err := os.Symlink(archivePath, dst); err != nil && !os.IsExist(err) {
-			slog.Error("test-packages: failed to symlink local archive", "err", err, "path", importPath)
-			os.Exit(1)
-		}
-	}
-
 	opts := testrunner.Options{
 		ModuleRoot:       m.ModuleRoot,
 		ImportCfg:        mergedCfg,
 		CompileImportCfg: compileCfg,
-		LocalDir:         localPkgsDir,
 		TrimPath:         tmpDir,
 		Tags:             strings.Join(m.Tags, ","),
 		GCFlagsList:      m.GCFlags,

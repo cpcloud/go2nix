@@ -37,12 +37,14 @@ are not tested.
 Each testable package goes through these steps:
 
 1. **Internal test compilation** — library source files + `_test.go` files
-   in the same package are compiled together into a single archive that
-   replaces the library archive.
-1. **Dependent recompilation** — local packages that transitively depend on
-   the package under test are recompiled against the test archive so the
-   dependency graph stays consistent (otherwise the xtest would link two
-   copies of the package — one with test helpers, one without).
+   in the same package are compiled together, in the package's directory,
+   into a single archive that replaces the library archive.
+1. **Dependent recompilation** — when the package has internal tests, local
+   packages that transitively depend on it are recompiled against the test
+   archive so the dependency graph stays consistent (otherwise the xtest
+   would link two copies of the package — one with test helpers, one
+   without). A package with external tests only keeps its archive, and so
+   do its dependents.
 1. **External test compilation** — `_test.go` files in the `*_test` package
    (xtests) are compiled as a separate package that imports the internal
    test archive.
@@ -89,12 +91,12 @@ that derivation: it relinks and re-runs the tests.
 
 Embed directives in test files are supported:
 
-- `TestEmbedPatterns` (from internal `_test.go` files) are resolved and
-  their files are symlinked into the internal test source directory alongside
-  the package's regular embed files. The embed configs are merged.
+- `TestEmbedPatterns` (from internal `_test.go` files) are resolved against
+  the package's directory and merged with the package's regular embed
+  config for the internal test archive.
 
-- `XTestEmbedPatterns` (from external `_test.go` files) are resolved and
-  symlinked into the xtest source directory with their own embed config.
+- `XTestEmbedPatterns` (from external `_test.go` files) are resolved the
+  same way into the external test package's own embed config.
 
 ## `extraMainSrcFiles`
 
@@ -125,6 +127,12 @@ goEnv.buildGoApplication {
 Each entry is relative to `src` (not `modRoot`). A directory entry includes
 its full subtree, and a trailing `/` is tolerated. An entry that does not
 exist under `src` fails evaluation.
+
+The same goes for a C header that a cgo file of a package with internal
+tests, or of a dependent recompiled for them, includes from a sub-directory
+(`#include "include/x.h"`): the package is compiled again for the tests
+from this copy, and `go list` reports only the headers next to the Go
+files. List the sub-directory.
 
 ## `checkFlags`
 
@@ -157,6 +165,9 @@ rewrites and the binary rejects them.
 - **The working directory is read-only.** Each test runs in its package's
   directory inside the filtered source copy, which is a store path: a test
   that writes next to its sources fails. Use `t.TempDir()`.
+- **Headers in a sub-directory of a cgo package** are not in the filtered
+  source copy; a package that is compiled again for tests needs them listed
+  in [`extraMainSrcFiles`](#extramainsrcfiles).
 - **No `go test` extras.** No coverage instrumentation, no `vet` pass, no
   default 10-minute timeout, and packages are tested one after another.
 - **`ldflags` do not reach test binaries**; they are linked with the

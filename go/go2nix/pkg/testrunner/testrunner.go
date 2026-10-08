@@ -27,7 +27,6 @@ type Options struct {
 	// local packages so test compiles cut off when no exported API
 	// changes). Empty means compile and link share ImportCfg.
 	CompileImportCfg string
-	LocalDir         string   // directory with compiled local .a files
 	TrimPath         string   // path prefix to trim
 	Tags             string   // comma-separated build tags
 	GCFlagsList      []string // extra compiler flags
@@ -277,42 +276,10 @@ func runPackageTests(opts Options, modulePath string, pkg *localpkgs.LocalPkg, p
 
 	// Step 1: Compile internal test archive (replaces library archive)
 	// This includes the library's GoFiles + internal _test.go files,
-	// compiled with the same import path as the original package.
-	internalArchive := filepath.Join(testDir, "internal.a")
+	// compiled with the same import path as the original package, in the
+	// package's own directory: a cgo file may include a header from a
+	// sub-directory, and the embed configs name files below SrcDir.
 	if len(pkg.TestGoFiles) > 0 {
-		// Create a merged source directory with library + test files
-		mergedDir := filepath.Join(testDir, "src-internal")
-		if err := os.MkdirAll(mergedDir, 0o755); err != nil {
-			return err
-		}
-		// Symlink all source files from the package directory
-		allFiles := append(append([]string{}, pkg.GoFiles...), pkg.CgoFiles...)
-		allFiles = append(allFiles, pkg.SFiles...)
-		allFiles = append(allFiles, pkg.CFiles...)
-		allFiles = append(allFiles, pkg.CXXFiles...)
-		allFiles = append(allFiles, pkg.HFiles...)
-		allFiles = append(allFiles, pkg.FFiles...)
-		allFiles = append(allFiles, pkg.SysoFiles...)
-		allFiles = append(allFiles, pkg.TestGoFiles...)
-		for _, f := range allFiles {
-			src := filepath.Join(pkg.SrcDir, f)
-			dst := filepath.Join(mergedDir, f)
-			if err := os.Symlink(src, dst); err != nil && !os.IsExist(err) {
-				return fmt.Errorf("symlinking %s: %w", f, err)
-			}
-		}
-		// Symlink production embed files and test-only embed files.
-		for _, f := range append(pkg.EmbedFiles, pkg.TestEmbedFiles...) {
-			src := filepath.Join(pkg.SrcDir, f)
-			dst := filepath.Join(mergedDir, f)
-			if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
-				return fmt.Errorf("creating embed dir for %s: %w", f, err)
-			}
-			if err := os.Symlink(src, dst); err != nil && !os.IsExist(err) {
-				return fmt.Errorf("symlinking embed %s: %w", f, err)
-			}
-		}
-
 		// Merge production + test embed configs for the compiler.
 		mergedEmbedCfg, err := gofiles.MergeEmbedCfg(pkg.EmbedCfg, pkg.TestEmbedCfg)
 		if err != nil {
@@ -325,9 +292,10 @@ func runPackageTests(opts Options, modulePath string, pkg *localpkgs.LocalPkg, p
 		// syso file sets so compile.CompileGoPackage takes the cgo or
 		// asm path instead of the pure-Go -complete path.
 		internalFiles := internalTestPkgFiles(pkg, mergedEmbedCfg)
+		internalArchive := filepath.Join(testDir, "internal.a")
 		if err := compile.CompileGoPackage(compile.Options{
 			ImportPath:  pkg.ImportPath,
-			SrcDir:      mergedDir,
+			SrcDir:      pkg.SrcDir,
 			Output:      internalArchive,
 			ImportCfg:   testCompileImportCfg,
 			TrimPath:    opts.TrimPath,
@@ -337,19 +305,10 @@ func runPackageTests(opts Options, modulePath string, pkg *localpkgs.LocalPkg, p
 		}); err != nil {
 			return fmt.Errorf("compiling internal test: %w", err)
 		}
-	} else {
-		// No internal tests — use the library archive as-is
-		libArchive := filepath.Join(opts.LocalDir, pkg.ImportPath+".a")
-		if err := copyFile(libArchive, internalArchive); err != nil {
-			// Library might be a command package (no .a), skip
-			internalArchive = ""
-		}
-	}
 
-	// Override the package entry in importcfg to point to the test archive.
-	// We rewrite the importcfg filtering out any existing entry for this
-	// package to avoid duplicate packagefile directives.
-	if internalArchive != "" {
+		// Override the package entry in importcfg to point to the test archive.
+		// We rewrite the importcfg filtering out any existing entry for this
+		// package to avoid duplicate packagefile directives.
 		if err := overrideBoth(pkg.ImportPath, internalArchive); err != nil {
 			return fmt.Errorf("overriding importcfg for %s: %w", pkg.ImportPath, err)
 		}
@@ -358,8 +317,12 @@ func runPackageTests(opts Options, modulePath string, pkg *localpkgs.LocalPkg, p
 	// Step 1b: Recompile local packages that transitively depend on the
 	// package under test ("recompileForTest"). After replacing the package
 	// archive with the internal test version, dependents must be recompiled
-	// so xtest compilation and linking see consistent archives.
-	if internalArchive != "" && len(pkg.XTestGoFiles) > 0 {
+	// so xtest compilation and linking see consistent archives. Without
+	// internal tests nothing was replaced: both importcfgs keep the entries
+	// of the package's own derivation, and cmd/go recompiles nothing either
+	// (load.recompileForTest replaces an import only where its test copy
+	// differs from it, and ptest is p then).
+	if len(pkg.TestGoFiles) > 0 && len(pkg.XTestGoFiles) > 0 {
 		// Filter xtest imports to local-only for the forward closure.
 		var xtestLocalImports []string
 		for _, imp := range pkg.XTestImports {
@@ -399,34 +362,11 @@ func runPackageTests(opts Options, modulePath string, pkg *localpkgs.LocalPkg, p
 	// Step 2: Compile external test archive
 	externalArchive := filepath.Join(testDir, "external.a")
 	if len(pkg.XTestGoFiles) > 0 {
-		xtestDir := filepath.Join(testDir, "src-xtest")
-		if err := os.MkdirAll(xtestDir, 0o755); err != nil {
-			return err
-		}
-		for _, f := range pkg.XTestGoFiles {
-			src := filepath.Join(pkg.SrcDir, f)
-			dst := filepath.Join(xtestDir, f)
-			if err := os.Symlink(src, dst); err != nil && !os.IsExist(err) {
-				return fmt.Errorf("symlinking %s: %w", f, err)
-			}
-		}
-		// Symlink xtest embed files.
-		for _, f := range pkg.XTestEmbedFiles {
-			src := filepath.Join(pkg.SrcDir, f)
-			dst := filepath.Join(xtestDir, f)
-			if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
-				return fmt.Errorf("creating xtest embed dir for %s: %w", f, err)
-			}
-			if err := os.Symlink(src, dst); err != nil && !os.IsExist(err) {
-				return fmt.Errorf("symlinking xtest embed %s: %w", f, err)
-			}
-		}
-
 		// Explicit file list: _test.go files would be classified as
 		// TestGoFiles/XTestGoFiles by ImportDir, not GoFiles.
 		if err := compile.CompileGoPackage(compile.Options{
 			ImportPath:  pkg.ImportPath + "_test",
-			SrcDir:      xtestDir,
+			SrcDir:      pkg.SrcDir,
 			Output:      externalArchive,
 			ImportCfg:   testCompileImportCfg,
 			TrimPath:    opts.TrimPath,
@@ -485,10 +425,6 @@ func runPackageTests(opts Options, modulePath string, pkg *localpkgs.LocalPkg, p
 
 	// Step 5: Link test binary
 	testBin := filepath.Join(testDir, "test.exe")
-	linkImportCfg := testImportCfg + ".link"
-	if err := copyFile(testImportCfg, linkImportCfg); err != nil {
-		return err
-	}
 
 	// Use `go tool link` rather than invoking the linker binary directly.
 	// The build phase invokes the linker directly to prevent GOROOT embedding
@@ -497,7 +433,7 @@ func runPackageTests(opts Options, modulePath string, pkg *localpkgs.LocalPkg, p
 	linkArgs := []string{
 		"tool", "link",
 		"-buildid=redacted",
-		"-importcfg", linkImportCfg,
+		"-importcfg", testImportCfg,
 		"-o", testBin,
 		testMainArchive,
 	}
