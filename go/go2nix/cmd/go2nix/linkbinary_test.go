@@ -508,6 +508,70 @@ func TestLinkBinaryFailureKillsRunningLinkers(t *testing.T) {
 	}
 }
 
+func TestLinkBinaryBackendConcurrencyFollowsCores(t *testing.T) {
+	const megabyte = 1 << 20
+	tests := []struct {
+		name          string
+		nixBuildCores string
+		switchEnv     string
+		sourceBytes   int
+		want          string
+	}{
+		{"small package", "8", "", 0, "-c=4"},
+		{"small package, two cores granted", "2", "", 0, "-c=2"},
+		{"large package", "8", "", megabyte, "-c=8"},
+		{"large package, all cores", "", "", megabyte, "-c=16"},
+		{"one core granted", "1", "", megabyte, "-c=1"},
+		{"switched off", "8", "0", megabyte, "-c=1"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			dir := fakeToolchain(t)
+			manifest := writeLinkFixture(t, "cmd/a")
+			setGOMAXPROCS(t, 32)
+			t.Setenv("NIX_BUILD_CORES", tt.nixBuildCores)
+			t.Setenv("GO19CONCURRENTCOMPILATION", tt.switchEnv)
+
+			var m compile.LinkManifest
+			data, err := os.ReadFile(manifest)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := json.Unmarshal(data, &m); err != nil {
+				t.Fatal(err)
+			}
+			padding := "\n// " + strings.Repeat("x", tt.sourceBytes) + "\n"
+			f, err := os.OpenFile(filepath.Join(m.ModuleRoot, "cmd/a/main.go"), os.O_APPEND|os.O_WRONLY, 0)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := f.WriteString(padding); err != nil {
+				t.Fatal(err)
+			}
+			if err := f.Close(); err != nil {
+				t.Fatal(err)
+			}
+
+			if err := linkBinary(manifest, t.TempDir()); err != nil {
+				t.Fatal(err)
+			}
+			calls := fakeCalls(t, dir, "compile")
+			if len(calls) != 1 {
+				t.Fatalf("compiler ran %d times, want 1", len(calls))
+			}
+			var got string
+			for _, arg := range calls[0] {
+				if strings.HasPrefix(arg, "-c=") {
+					got = arg
+				}
+			}
+			if got != tt.want {
+				t.Errorf("compiler was passed %q, want %q (%q)", got, tt.want, calls[0])
+			}
+		})
+	}
+}
+
 func noOrder(n int) []int {
 	after := make([]int, n)
 	for i := range after {

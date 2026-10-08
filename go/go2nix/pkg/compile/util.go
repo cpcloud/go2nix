@@ -210,12 +210,27 @@ func buildCores(nixBuildCores string, gomaxprocs int) int {
 	return gomaxprocs
 }
 
-// gcBackendConcurrency returns the -c flag value for the Go compiler,
-// matching cmd/go/internal/work.gcBackendConcurrency (gc.go:181-239).
-// Enables concurrent backend compilation within a single go tool compile
-// invocation. Capped at min(4, GOMAXPROCS) since go2nix already handles
-// package-level parallelism. Respects GO19CONCURRENTCOMPILATION env var.
-func gcBackendConcurrency() int {
+const (
+	// baseBackendConcurrency is what every compile gets, cmd/go's minTokens.
+	baseBackendConcurrency = 4
+	// A package with at least largePackageBytes of Go source gets up to
+	// maxBackendConcurrency.
+	largePackageBytes     = 1 << 20
+	maxBackendConcurrency = 16
+)
+
+// gcBackendConcurrency returns the -c flag value for compiling opts.Files.
+//
+// cmd/go (compilerConcurrency in $GOROOT/src/cmd/go/internal/work/gc.go)
+// gives every compile min(4, GOMAXPROCS) backend workers and lets it borrow
+// more, up to GOMAXPROCS, from a pool that all compiles of one `go build`
+// share. Package derivations have no pool to share and Nix runs max-jobs of
+// them at once, so more than 4 goes only to a package with at least
+// largePackageBytes of Go source, and both figures are capped by BuildCores.
+//
+// GO19CONCURRENTCOMPILATION=0 turns concurrent compilation off; cmd/go 1.26
+// does not read that variable.
+func gcBackendConcurrency(opts Options) int {
 	switch os.Getenv("GO19CONCURRENTCOMPILATION") {
 	case "0":
 		return 1
@@ -226,11 +241,30 @@ func gcBackendConcurrency() int {
 	default:
 		return 1
 	}
-	c := runtime.GOMAXPROCS(0)
-	if c > 4 {
-		c = 4
+	return backendConcurrency(BuildCores(), goSourceBytes(opts))
+}
+
+func backendConcurrency(cores int, sourceBytes int64) int {
+	if sourceBytes >= largePackageBytes {
+		return min(cores, maxBackendConcurrency)
 	}
-	return c
+	return min(cores, baseBackendConcurrency)
+}
+
+// goSourceBytes returns the size of the Go files of the package.
+func goSourceBytes(opts Options) int64 {
+	if opts.Files == nil {
+		return 0
+	}
+	var total int64
+	for _, names := range [][]string{opts.Files.GoFiles, opts.Files.CgoFiles} {
+		for _, name := range names {
+			if fi, err := os.Stat(filepath.Join(opts.SrcDir, name)); err == nil {
+				total += fi.Size()
+			}
+		}
+	}
+	return total
 }
 
 func extractPackageName(goFile string) string {

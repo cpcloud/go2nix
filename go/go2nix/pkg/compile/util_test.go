@@ -3,7 +3,10 @@ package compile
 import (
 	"os"
 	"path/filepath"
+	"runtime"
 	"testing"
+
+	"github.com/numtide/go2nix/pkg/gofiles"
 )
 
 func TestEnvOrDefault(t *testing.T) {
@@ -203,5 +206,91 @@ func TestBuildCores(t *testing.T) {
 	t.Setenv("NIX_BUILD_CORES", "1")
 	if got := BuildCores(); got != 1 {
 		t.Errorf("BuildCores() with NIX_BUILD_CORES=1 = %d, want 1", got)
+	}
+}
+
+func TestBackendConcurrency(t *testing.T) {
+	const small, large = largePackageBytes - 1, largePackageBytes
+	tests := []struct {
+		name        string
+		cores       int
+		sourceBytes int64
+		want        int
+	}{
+		{"small package, many cores", 32, small, 4},
+		{"small package, two cores", 2, small, 2},
+		{"small package, one core", 1, small, 1},
+		{"empty package", 32, 0, 4},
+		{"large package, many cores", 32, large, 16},
+		{"large package, sixteen cores", 16, large, 16},
+		{"large package, eight cores", 8, large, 8},
+		{"large package, two cores", 2, large, 2},
+		{"large package, one core", 1, large, 1},
+		{"huge package", 64, 100 * large, 16},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := backendConcurrency(tt.cores, tt.sourceBytes); got != tt.want {
+				t.Errorf("backendConcurrency(%d, %d) = %d, want %d", tt.cores, tt.sourceBytes, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestGCBackendConcurrency(t *testing.T) {
+	dir := t.TempDir()
+	write := func(name string, size int) {
+		t.Helper()
+		if err := os.WriteFile(filepath.Join(dir, name), make([]byte, size), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	write("a.go", largePackageBytes/2)
+	write("b.go", largePackageBytes/2-1)
+	write("c.go", 1)
+	write("cgo.go", largePackageBytes)
+	smallPkg := Options{SrcDir: dir, Files: &gofiles.PkgFiles{GoFiles: []string{"a.go", "b.go"}}}
+	largePkg := Options{SrcDir: dir, Files: &gofiles.PkgFiles{GoFiles: []string{"a.go", "b.go", "c.go"}}}
+	cgoPkg := Options{SrcDir: dir, Files: &gofiles.PkgFiles{GoFiles: []string{"c.go"}, CgoFiles: []string{"cgo.go"}}}
+	missing := Options{SrcDir: dir, Files: &gofiles.PkgFiles{GoFiles: []string{"nope.go"}}}
+
+	prev := runtime.GOMAXPROCS(32)
+	t.Cleanup(func() { runtime.GOMAXPROCS(prev) })
+
+	tests := []struct {
+		name          string
+		nixBuildCores string
+		switchEnv     string
+		opts          Options
+		want          int
+	}{
+		{"small, cores unset", "", "", smallPkg, 4},
+		{"small, two cores granted", "2", "", smallPkg, 2},
+		{"large, cores unset", "", "", largePkg, 16},
+		{"large, zero means all", "0", "", largePkg, 16},
+		{"large, eight cores granted", "8", "", largePkg, 8},
+		{"large, more cores granted than the process has", "64", "", largePkg, 16},
+		{"cgo files count", "", "", cgoPkg, 16},
+		{"unreadable files count for nothing", "", "", missing, 4},
+		{"no file list", "", "", Options{SrcDir: dir}, 4},
+		{"switched off", "", "0", largePkg, 1},
+		{"switched on", "", "1", largePkg, 16},
+		{"unknown switch value", "", "2", largePkg, 1},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Setenv("NIX_BUILD_CORES", tt.nixBuildCores)
+			t.Setenv("GO19CONCURRENTCOMPILATION", tt.switchEnv)
+			if got := gcBackendConcurrency(tt.opts); got != tt.want {
+				t.Errorf("gcBackendConcurrency = %d, want %d", got, tt.want)
+			}
+		})
+	}
+
+	runtime.GOMAXPROCS(2)
+	t.Setenv("NIX_BUILD_CORES", "")
+	t.Setenv("GO19CONCURRENTCOMPILATION", "")
+	if got := gcBackendConcurrency(largePkg); got != 2 {
+		t.Errorf("GOMAXPROCS=2: gcBackendConcurrency = %d, want 2", got)
 	}
 }

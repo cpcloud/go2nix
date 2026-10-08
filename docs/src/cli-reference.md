@@ -88,6 +88,11 @@ derivation runs it, in both modes: directly from the raw builder for pure-Go
 packages, through the `compile-go-pkg.sh` hook for cgo ones, and from the
 derivations `go2nix resolve` registers in experimental mode.
 
+The compiler's backend concurrency (`-c`) is the number of cores Nix grants
+(`NIX_BUILD_CORES`; unset or `0` means all, and never more than GOMAXPROCS),
+up to 4, and up to 16 for a package with at least 1 MiB of Go source.
+`GO19CONCURRENTCOMPILATION=0` in the derivation's environment makes it 1.
+
 ```
 go2nix compile-package --manifest FILE --import-path PATH --src-dir DIR --output FILE [flags]
 ```
