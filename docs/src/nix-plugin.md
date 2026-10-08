@@ -36,10 +36,12 @@ The Go toolchain is the plugin's own `pkgs.go`, baked in when the plugin is
 built (override `pkgs.go` to use another; it need not be the `go` you hand to
 `mkGoEnv`), and it runs with `GOTOOLCHAIN=local`. A `go` attribute is
 ignored with a warning, because `go list` runs at evaluation time with the
-evaluator's privileges. A source-path `src` carries no derivation context, so
-default-mode evaluation stays IFD-free; a derivation-backed `src` is accepted
-but emits a warning and forces the plugin to realise the derivation at eval
-time — i.e. opt-in IFD, still gated by `allow-import-from-derivation`.
+evaluator's privileges. So is a `storeDir` attribute: the plugin itself tells
+the resolver where the store is (see [Purity](#purity)). A source-path `src`
+carries no derivation context, so default-mode evaluation stays IFD-free; a
+derivation-backed `src` is accepted but emits a warning and forces the plugin
+to realise the derivation at eval time — i.e. opt-in IFD, still gated by
+`allow-import-from-derivation`.
 
 It runs `go list -deps -json` for `subPackages` in `src/modRoot`. When
 `doCheck` is set it runs `go list -deps -test` over `./...` and every
@@ -175,6 +177,21 @@ To check from the command line: `nix eval --expr 'builtins ? resolveGoPackages'`
 `builtins.resolveGoPackages` is impure: it runs `go list`. The Nix
 evaluator does **not** cache its result, so it runs on every evaluation,
 once per `buildGoApplication` call.
+
+With `doCheck` (the default), calls made by one evaluator process share a
+`go list` run when they list the same module from a `src` inside the Nix
+store (which is what `src = ./.` is in a flake) with the same tags, target
+platform, `CGO_ENABLED`, `goProxy` and environment: ten commands of one
+`go.mod` built as ten `buildGoApplication` calls cost one run, and each call
+still gets the graph of its own `subPackages`. A `src` outside the store is
+listed by every call, because it can change while a `nix repl` or a language
+server keeps running. So is a module that reaches outside the store: one
+whose `go.mod` replaces another with a directory out there, or that has a
+`go.mod`, a package directory or a file in a package directory that is a
+symlink to somewhere outside the store. Output in which a package has an
+error is not kept: the module cache may have what it lacked by the next
+call. A process keeps at most 64 MiB of `go list` output for this and drops
+the least recently used first.
 
 What `go list` sees is fixed by the plugin, not by your shell. The
 environment is cleared and only `GOMODCACHE`, `GOPATH`, `HOME`, `GOPROXY`
