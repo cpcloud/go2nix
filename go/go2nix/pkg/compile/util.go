@@ -9,6 +9,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 
@@ -192,6 +193,21 @@ func LangVersion(v string) string {
 	}
 	minor, _, _ := strings.Cut(rest, ".")
 	return major + "." + minor
+}
+
+// BuildCores returns how many CPU-bound jobs this process may run at once: the
+// cores Nix granted the build in NIX_BUILD_CORES, never more than GOMAXPROCS.
+// 0 means all of them, as in nixpkgs' stdenv. So does unset, which Nix never
+// leaves it (stdenv would make that 1).
+func BuildCores() int {
+	return buildCores(os.Getenv("NIX_BUILD_CORES"), runtime.GOMAXPROCS(0))
+}
+
+func buildCores(nixBuildCores string, gomaxprocs int) int {
+	if n, err := strconv.Atoi(nixBuildCores); err == nil && n > 0 && n < gomaxprocs {
+		return n
+	}
+	return gomaxprocs
 }
 
 // gcBackendConcurrency returns the -c flag value for the Go compiler,

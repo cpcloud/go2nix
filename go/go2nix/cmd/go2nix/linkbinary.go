@@ -1,19 +1,27 @@
 package main
 
 import (
+	"bytes"
+	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"go/build"
+	"io"
 	"log/slog"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
+	"strconv"
 	"strings"
+	"sync"
 
 	"github.com/numtide/go2nix/pkg/buildinfo"
 	"github.com/numtide/go2nix/pkg/compile"
 	"github.com/numtide/go2nix/pkg/localpkgs"
 	"github.com/numtide/go2nix/pkg/mvscheck"
+	"golang.org/x/sync/errgroup"
 )
 
 func runLinkBinaryCmd(args []string) {
@@ -34,6 +42,11 @@ func runLinkBinaryCmd(args []string) {
 }
 
 func linkBinary(manifestPath, output string) error {
+	return linkBinaryTo(os.Stderr, manifestPath, output)
+}
+
+// linkBinaryTo is linkBinary with the log of the binaries written to w.
+func linkBinaryTo(w io.Writer, manifestPath, output string) error {
 	m, err := compile.LoadLinkManifest(manifestPath)
 	if err != nil {
 		return err
@@ -133,7 +146,7 @@ func linkBinary(manifestPath, output string) error {
 
 	// DefaultGODEBUG depends on per-main-package //go:debug source
 	// directives, so it (and the BuildSettings that carry it) is computed
-	// inside the SubPackages loop. Everything else is invariant.
+	// per binary. Everything else is invariant.
 	settings := buildinfo.BuildSettings{
 		BuildMode:  buildMode,
 		Tags:       strings.Join(m.Tags, ","),
@@ -154,14 +167,10 @@ func linkBinary(manifestPath, output string) error {
 	bctx.BuildTags = m.Tags
 
 	// Step 6: Read merged importcfg once; the per-binary modinfo line (which
-	// carries BuildInfo.Path = main package import path) is appended inside
-	// the SubPackages loop so each binary records its own path.
+	// carries BuildInfo.Path = main package import path) is appended per
+	// binary so each one records its own path.
 	mergedCfgData, err := os.ReadFile(mergedCfg)
 	if err != nil {
-		return err
-	}
-	linkCfgDir := filepath.Join(tmpDir, "linkcfg")
-	if err := os.MkdirAll(linkCfgDir, 0o755); err != nil {
 		return err
 	}
 
@@ -202,16 +211,13 @@ func linkBinary(manifestPath, output string) error {
 	}
 	userExtld := hasExtld(ldflags)
 
-	for _, sp := range m.SubPackages {
-		deps := make([]buildinfo.ModDep, 0, len(sp.Modules))
-		for _, mm := range sp.Modules {
-			dep := buildinfo.ModDep{Path: mm.Path, Version: mm.Version}
-			if mm.ReplacePath != "" {
-				dep.Replace = &buildinfo.ModDep{Path: mm.ReplacePath, Version: mm.ReplaceVersion}
-			}
-			deps = append(deps, dep)
-		}
-
+	type mainTarget struct{ importpath, srcdir, binname string }
+	targets := make([]mainTarget, len(m.SubPackages))
+	// Binaries with the same name share an output file: each waits for the
+	// one listed before it, so the one listed last is what bin/ is left with.
+	after := make([]int, len(m.SubPackages))
+	lastNamed := map[string]int{}
+	for i, sp := range m.SubPackages {
 		var importpath, srcdir, binname string
 
 		clean := strings.TrimPrefix(sp.Path, "./")
@@ -228,11 +234,35 @@ func linkBinary(manifestPath, output string) error {
 			binname = filepath.Base(clean)
 		}
 
+		targets[i] = mainTarget{importpath, srcdir, binname}
+		after[i] = -1
+		if prev, ok := lastNamed[binname]; ok {
+			after[i] = prev
+		}
+		lastNamed[binname] = i
+	}
+
+	linkOne := func(ctx context.Context, job linkJob) error {
+		sp, target := m.SubPackages[job.index], targets[job.index]
+		importpath, srcdir, binname := target.importpath, target.srcdir, target.binname
+		// The handler main() installs, writing to this binary's log.
+		logger := slog.New(slog.NewTextHandler(job.log, nil))
+
+		deps := make([]buildinfo.ModDep, 0, len(sp.Modules))
+		for _, mm := range sp.Modules {
+			dep := buildinfo.ModDep{Path: mm.Path, Version: mm.Version}
+			if mm.ReplacePath != "" {
+				dep.Replace = &buildinfo.ModDep{Path: mm.ReplacePath, Version: mm.ReplaceVersion}
+			}
+			deps = append(deps, dep)
+		}
+
 		srcDirectives := buildinfo.ParseSourceGodebugs(&bctx, srcdir)
 		godebugDefault := buildinfo.DefaultGODEBUG(m.ModuleRoot, srcDirectives, goFips140, goVersion, goroot)
-		settings.DefaultGODEBUG = godebugDefault
+		binSettings := settings
+		binSettings.DefaultGODEBUG = godebugDefault
 
-		slog.Info("compiling main", "pkg", importpath)
+		logger.Info("compiling main", "pkg", importpath)
 
 		mainArchive := filepath.Join(mainDir, importpath+".a")
 		if err := os.MkdirAll(filepath.Dir(mainArchive), 0o755); err != nil {
@@ -252,7 +282,7 @@ func linkBinary(manifestPath, output string) error {
 			SrcDir:      srcdir,
 			Output:      mainArchive,
 			ImportCfg:   compileCfg,
-			TrimPath:    tmpDir,
+			TrimPath:    job.scratch,
 			GCFlagsList: gcflagsList,
 			Tags:        m.Tags,
 			PGOProfile:  pgoProfile,
@@ -296,18 +326,18 @@ func linkBinary(manifestPath, output string) error {
 		// object file (cmd/go/internal/work/gc.go:607-609). The file is
 		// only used for `go build -work` inspection; we discard it.
 		if buildinfo.Fips140Enabled(goFips140) {
-			linkFlags = append(linkFlags, "-fipso", filepath.Join(tmpDir, "fips.o"))
+			linkFlags = append(linkFlags, "-fipso", filepath.Join(job.scratch, "fips.o"))
 		}
 
 		// Per-binary modinfo: BuildInfo.Path must be the main package's
 		// import path (matching `go build`), so each subPackage gets its
 		// own importcfg.link.
-		modinfo, err := buildinfo.GenerateModinfo(m.ModuleRoot, importpath, goVersion, deps, settings)
+		modinfo, err := buildinfo.GenerateModinfo(m.ModuleRoot, importpath, goVersion, deps, binSettings)
 		if err != nil {
 			return fmt.Errorf("generating modinfo for %s: %w", importpath, err)
 		}
-		linkCfg := filepath.Join(linkCfgDir, binname+".importcfg.link")
-		if err := os.WriteFile(linkCfg, append(mergedCfgData, []byte(modinfo+"\n")...), 0o644); err != nil {
+		linkCfg := filepath.Join(job.scratch, "importcfg.link")
+		if err := os.WriteFile(linkCfg, slices.Concat(mergedCfgData, []byte(modinfo+"\n")), 0o644); err != nil {
 			return err
 		}
 
@@ -322,16 +352,102 @@ func linkBinary(manifestPath, output string) error {
 		linkArgs = append(linkArgs, "-o", filepath.Join(binDir, binname))
 		linkArgs = append(linkArgs, mainArchive)
 
-		slog.Info("linking", "pkg", importpath, "bin", binname)
-		cmd := exec.Command(goLinkTool, linkArgs...)
-		cmd.Stdout = os.Stdout
-		cmd.Stderr = os.Stderr
+		logger.Info("linking", "pkg", importpath, "bin", binname)
+		cmd := exec.CommandContext(ctx, goLinkTool, linkArgs...)
+		cmd.Stdout = job.log
+		cmd.Stderr = job.log
 		if err := cmd.Run(); err != nil {
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
 			return fmt.Errorf("linking %s: %w", importpath, err)
+		}
+		return nil
+	}
+
+	return runLinkJobs(context.Background(), len(m.SubPackages), compile.BuildCores(), filepath.Join(tmpDir, "link-scratch"), after, w, linkOne)
+}
+
+// linkJob is what runLinkJobs hands to the function that builds one binary.
+type linkJob struct {
+	index   int
+	scratch string    // directory of its own for temporary files
+	log     io.Writer // receives the binary's log lines and tool output
+}
+
+// runLinkJobs calls run for binaries 0 to n-1 on at most limit goroutines and
+// gives each a scratch directory of its own under scratchRoot. after[i] is -1
+// or the index of an earlier binary that must finish before binary i starts.
+// The logs reach w in index order whatever order the binaries finish in, each
+// as soon as every binary before it is done. The first failure cancels ctx
+// for the others; the error returned is that of the lowest-numbered binary
+// that failed for a reason of its own, and no log is printed past it.
+func runLinkJobs(ctx context.Context, n, limit int, scratchRoot string, after []int, w io.Writer, run func(context.Context, linkJob) error) error {
+	logs := make([]bytes.Buffer, n)
+	errs := make([]error, n)
+	done := make([]chan struct{}, n)
+	for i := range done {
+		done[i] = make(chan struct{})
+	}
+	ownFailure := func(i int) bool {
+		return errs[i] != nil && !errors.Is(errs[i], context.Canceled)
+	}
+	// One binary at a time runs in index order, so its log can go straight to w.
+	unbuffered := n == 1 || limit == 1
+
+	var mu sync.Mutex // guards finished, next, stopped and the writes to w
+	finished := make([]bool, n)
+	next, stopped := 0, false
+	flush := func(i int) {
+		mu.Lock()
+		defer mu.Unlock()
+		finished[i] = true
+		for !stopped && next < n && finished[next] {
+			_, _ = w.Write(logs[next].Bytes())
+			stopped = ownFailure(next)
+			next++
 		}
 	}
 
-	return nil
+	g, gctx := errgroup.WithContext(ctx)
+	g.SetLimit(limit)
+	for i := range n {
+		g.Go(func() error {
+			defer close(done[i])
+			defer flush(i)
+			if after[i] >= 0 {
+				select {
+				case <-done[after[i]]:
+					// done is closed before the group cancels gctx.
+					if errs[after[i]] != nil {
+						errs[i] = context.Canceled
+						return errs[i]
+					}
+				case <-gctx.Done():
+				}
+			}
+			errs[i] = gctx.Err()
+			if errs[i] != nil {
+				return errs[i]
+			}
+			job := linkJob{index: i, scratch: filepath.Join(scratchRoot, strconv.Itoa(i)), log: &logs[i]}
+			if unbuffered {
+				job.log = w
+			}
+			if errs[i] = os.MkdirAll(job.scratch, 0o755); errs[i] == nil {
+				errs[i] = run(gctx, job)
+			}
+			return errs[i]
+		})
+	}
+	waitErr := g.Wait()
+
+	for i := range n {
+		if ownFailure(i) {
+			return errs[i]
+		}
+	}
+	return waitErr
 }
 
 // goToolchain reports the version and the GOROOT of the toolchain gobin

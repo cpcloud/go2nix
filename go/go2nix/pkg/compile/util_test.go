@@ -175,3 +175,33 @@ func TestExtractPackageName(t *testing.T) {
 		t.Errorf("invalid syntax: got %q, want %q", got, "main")
 	}
 }
+
+func TestBuildCores(t *testing.T) {
+	tests := []struct {
+		name          string
+		nixBuildCores string
+		gomaxprocs    int
+		want          int
+	}{
+		{"unset means all", "", 8, 8},
+		{"zero means all", "0", 8, 8},
+		{"grant below the machine", "2", 8, 2},
+		{"grant equal to the machine", "8", 8, 8},
+		{"grant above what the process can run", "64", 8, 8},
+		{"one core", "1", 8, 1},
+		{"negative is ignored", "-1", 8, 8},
+		{"not a number is ignored", "many", 8, 8},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := buildCores(tt.nixBuildCores, tt.gomaxprocs); got != tt.want {
+				t.Errorf("buildCores(%q, %d) = %d, want %d", tt.nixBuildCores, tt.gomaxprocs, got, tt.want)
+			}
+		})
+	}
+
+	t.Setenv("NIX_BUILD_CORES", "1")
+	if got := BuildCores(); got != 1 {
+		t.Errorf("BuildCores() with NIX_BUILD_CORES=1 = %d, want 1", got)
+	}
+}

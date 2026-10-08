@@ -62,7 +62,7 @@ and the [plugin](nix-plugin.md) loaded. See
 | `checkFlags = [ "-v" "-run" "X" ]` | `checkFlags = [ "-test.v" "-test.run" "X" ]` | The flags go to the test binary itself, not through `go test`. |
 | `buildTestBinaries` | none | |
 | `allowGoReference` | `allowGoReference` | Same meaning and default. |
-| `enableParallelBuilding` | none | Parallelism is Nix building independent package derivations. |
+| `enableParallelBuilding` | none; `preBuild = "export NIX_BUILD_CORES=1";` for `false` | Parallelism is Nix building independent package derivations. Inside the final one, the links of an application's `subPackages` use the cores Nix grants (`cores`, `NIX_BUILD_CORES`). The final derivation holds as many links in memory as it runs; exporting `NIX_BUILD_CORES=1` in `preBuild`, which is what `buildGoModule` does for `enableParallelBuilding = false`, builds the binaries one at a time. |
 | `preBuild`, `postInstall`, other phases and hooks | passed through | They run in the final derivation, which compiles the main packages, links and tests. They cannot affect how a dependency or a library package of yours is compiled: that happened in another derivation. |
 | `go generate` in `preBuild` | `packageOverrides.<import path>.srcOverlay`, or commit the generated files | A package is compiled from its directory in `src`, plus an optional overlay derivation laid over it. |
 | `buildGoModule.override { go = …; }` | `mkGoEnv { go = …; }` | The toolchain is a property of the scope. |
