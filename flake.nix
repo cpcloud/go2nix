@@ -118,6 +118,11 @@
           test-fixture-cgo-directives = callPkgWith ./packages/test-fixture-cgo-directives/default.nix {
             inherit flake system;
           };
+          test-fixture-cgo-flag-allowlist =
+            callPkgWith ./packages/test-fixture-cgo-flag-allowlist/default.nix
+              {
+                inherit flake system;
+              };
           test-fixture-build-tags = callPkgWith ./packages/test-fixture-build-tags/default.nix {
             inherit flake system;
           };
