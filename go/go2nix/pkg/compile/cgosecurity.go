@@ -8,6 +8,8 @@
 // internal/lazyregexp, os.Getenv for cfg.Getenv, safeArg (at the end, from
 // cmd/go/internal/load/pkg.go) for load.SafeArg, and the two errors about a
 // malformed CGO_*_ALLOW or CGO_*_DISALLOW wrap with %w.
+// scripts/check-cgo-flag-tables.go compares the rest with the toolchain's
+// file.
 
 // Checking of compiler and linker flags.
 // We must avoid flags like -fplugin=, which can allow
