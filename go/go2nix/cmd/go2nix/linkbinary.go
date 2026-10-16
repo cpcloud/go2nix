@@ -120,9 +120,9 @@ func linkBinary(manifestPath, output string) error {
 	buildMode := compile.DefaultBuildMode(goos, goarch)
 
 	// Step 5: Compute modinfo.
-	goVersion, err := goToolchainVersion()
+	goVersion, goroot, err := goToolchain("go")
 	if err != nil {
-		return fmt.Errorf("getting Go version: %w", err)
+		return fmt.Errorf("asking go env for the toolchain: %w", err)
 	}
 
 	// GOFIPS140 reaches this drv via the scope-level goEnv merge into env
@@ -229,7 +229,7 @@ func linkBinary(manifestPath, output string) error {
 		}
 
 		srcDirectives := buildinfo.ParseSourceGodebugs(&bctx, srcdir)
-		godebugDefault := buildinfo.DefaultGODEBUG(m.ModuleRoot, srcDirectives, goFips140, goVersion)
+		godebugDefault := buildinfo.DefaultGODEBUG(m.ModuleRoot, srcDirectives, goFips140, goVersion, goroot)
 		settings.DefaultGODEBUG = godebugDefault
 
 		slog.Info("compiling main", "pkg", importpath)
@@ -334,12 +334,19 @@ func linkBinary(manifestPath, output string) error {
 	return nil
 }
 
-func goToolchainVersion() (string, error) {
-	out, err := exec.Command("go", "env", "GOVERSION").Output()
+// goToolchain reports the version and the GOROOT of the toolchain gobin
+// belongs to.
+func goToolchain(gobin string) (version, goroot string, err error) {
+	out, err := exec.Command(gobin, "env", "GOVERSION", "GOROOT").Output()
 	if err != nil {
-		return "", err
+		return "", "", err
 	}
-	return strings.TrimSpace(string(out)), nil
+	version, goroot, _ = strings.Cut(strings.TrimSpace(string(out)), "\n")
+	version, goroot = strings.TrimSpace(version), strings.TrimSpace(goroot)
+	if goroot == "" {
+		slog.Warn("go env GOROOT is empty: default GODEBUG falls back on the built-in table", "go", gobin)
+	}
+	return version, goroot, nil
 }
 
 // hasExtld reports whether ldflags already specify -extld, mirroring

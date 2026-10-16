@@ -79,8 +79,22 @@ func main() {
 		}
 		delete(cm, e.Name)
 	}
-	for _, e := range cm {
+	for _, c := range committed {
+		e, left := cm[c.Name]
+		if !left {
+			continue
+		}
 		if e.Changed > toolchainMinor || (e.Removed > 0 && e.Removed > toolchainMinor) {
+			upstream = append(upstream, e)
+			continue
+		}
+		// A live row of this toolchain's own minors that its table.go does
+		// not have: a later patch release, or another release line, added
+		// it (httpservecontentmaxranges: Go 1.27.2 and 1.26.9). This
+		// release cannot tell that from a row that was never upstream's,
+		// so it is kept and reported, not counted as stale.
+		if e.Removed == 0 {
+			fmt.Fprintf(os.Stderr, "note: %q (Changed: %d) is not in this toolchain's table.go; kept as a setting of a later release\n", e.Name, e.Changed)
 			upstream = append(upstream, e)
 		}
 	}
@@ -95,10 +109,11 @@ func main() {
 	}
 
 	// Check mode. The committed table is a superset over toolchains: it
-	// carries settings newer toolchains added (Changed > this one) and
-	// settings this toolchain already retired (Removed set), both of which
-	// this toolchain's table.go cannot vouch for. Only disagreements it can
-	// see are stale.
+	// carries settings newer toolchains added (Changed > this one), settings
+	// a later patch release or another release line added (Changed at or
+	// below this one, absent from its table.go) and settings this toolchain
+	// already retired (Removed set), none of which this toolchain's table.go
+	// can vouch for. Only disagreements it can see are stale.
 	diff := diffTables(committed, upstream, toolchainMinor)
 	if diff == "" {
 		fmt.Printf("OK: godebugTable consistent with go1.%d's table.go (%d committed entries)\n", toolchainMinor, len(committed))
@@ -149,7 +164,11 @@ func parseUpstream(path string) ([]entry, error) {
 		return nil, fmt.Errorf("parse %s: %w", path, err)
 	}
 
-	var entries []entry
+	// go2nix reads this file itself when it builds (toolchainTable in
+	// godebug.go) and falls back on the committed copy when it cannot. A
+	// shape it would refuse has to fail here too, or no check would say
+	// that every build under this toolchain is on the fallback.
+	var all *ast.CompositeLit
 	for _, decl := range f.Decls {
 		gd, ok := decl.(*ast.GenDecl)
 		if !ok || gd.Tok != token.VAR {
@@ -157,23 +176,41 @@ func parseUpstream(path string) ([]entry, error) {
 		}
 		for _, spec := range gd.Specs {
 			vs, ok := spec.(*ast.ValueSpec)
-			if !ok || len(vs.Names) == 0 || vs.Names[0].Name != "All" {
-				continue
+			if ok && len(vs.Names) == 1 && vs.Names[0].Name == "All" && len(vs.Values) == 1 {
+				all, _ = vs.Values[0].(*ast.CompositeLit)
 			}
-			if len(vs.Values) != 1 {
-				continue
-			}
-			comp, ok := vs.Values[0].(*ast.CompositeLit)
+		}
+	}
+	if all == nil {
+		return nil, fmt.Errorf("%s: no `var All = []Info{...}`; has table.go changed shape?", path)
+	}
+	var entries []entry
+	for _, elt := range all.Elts {
+		info, ok := elt.(*ast.CompositeLit)
+		if !ok {
+			return nil, fmt.Errorf("%s: an element of All is not a composite literal", path)
+		}
+		for _, field := range info.Elts {
+			kv, ok := field.(*ast.KeyValueExpr)
 			if !ok {
-				continue
+				return nil, fmt.Errorf("%s: an Info without field names", path)
 			}
-			for _, elt := range comp.Elts {
-				e, ok := extractEntry(elt)
-				if ok && e.Changed > 0 {
-					entries = append(entries, e)
+			if key, _ := kv.Key.(*ast.Ident); key != nil && (key.Name == "Name" || key.Name == "Old" || key.Name == "Changed") {
+				if _, ok := kv.Value.(*ast.BasicLit); !ok {
+					return nil, fmt.Errorf("%s: a %s that is not a literal", path, key.Name)
 				}
 			}
 		}
+		e, ok := extractEntry(elt)
+		if !ok {
+			return nil, fmt.Errorf("%s: an Info without a Name", path)
+		}
+		if e.Changed > 0 {
+			entries = append(entries, e)
+		}
+	}
+	if len(entries) == 0 {
+		return nil, fmt.Errorf("%s: no entry of All with Changed set; has table.go changed shape?", path)
 	}
 
 	sort.Slice(entries, func(i, j int) bool {
@@ -341,11 +378,6 @@ func diffTables(committed, upstream []entry, toolchainMinor int) string {
 	for _, e := range committed {
 		cm[e.Name] = e
 	}
-	um := make(map[string]entry, len(upstream))
-	for _, e := range upstream {
-		um[e.Name] = e
-	}
-
 	var buf strings.Builder
 
 	// Missing from committed: every live or retired setting this toolchain
@@ -354,17 +386,6 @@ func diffTables(committed, upstream []entry, toolchainMinor int) string {
 		if _, ok := cm[e.Name]; !ok {
 			fmt.Fprintf(&buf, "  + missing: {Name: %q, Changed: %d, Old: %q, Removed: %d}\n", e.Name, e.Changed, e.Old, e.Removed)
 		}
-	}
-	// Extra in committed: only stale if this toolchain should know it, i.e.
-	// it was changed on or before this toolchain and not retired by it.
-	for _, e := range committed {
-		if _, ok := um[e.Name]; ok {
-			continue
-		}
-		if e.Changed > toolchainMinor || (e.Removed > 0 && e.Removed <= toolchainMinor) {
-			continue
-		}
-		fmt.Fprintf(&buf, "  - extra:   {Name: %q, Changed: %d, Old: %q, Removed: %d}\n", e.Name, e.Changed, e.Old, e.Removed)
 	}
 	// Disagreements on settings both sides know.
 	for _, u := range upstream {

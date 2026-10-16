@@ -13,7 +13,7 @@ func TestDefaultGODEBUG_Go121(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	result := DefaultGODEBUG(dir, nil, "", "go1.26.3")
+	result := DefaultGODEBUG(dir, nil, "", "go1.26.3", "")
 
 	// Go 1.21 is before many Changed versions, so we expect several entries.
 	if result == "" {
@@ -59,7 +59,7 @@ func TestDefaultGODEBUG_RemovedByToolchain(t *testing.T) {
 		{"", true}, // unknown toolchain: assume the newest, i.e. retired
 		{"devel", true},
 	} {
-		result := DefaultGODEBUG(dir, nil, "", tc.toolchain)
+		result := DefaultGODEBUG(dir, nil, "", tc.toolchain, "")
 		if got := contains(result, "asynctimerchan=1"); got == tc.removed {
 			t.Errorf("toolchain %q: asynctimerchan=1 present=%v, want present=%v (got %q)", tc.toolchain, got, !tc.removed, result)
 		}
@@ -91,7 +91,7 @@ func TestDefaultGODEBUG_MatchesToolchainTable(t *testing.T) {
 		{"go1.26.3", []string{"asynctimerchan=1", "tlsrsakex=1", "httplaxcontentlength=1"}, []string{"tracebacklabels=", "x509sslcertoverrideplatform="}},
 		{"go1.27.0", []string{"tracebacklabels=0", "x509sslcertoverrideplatform=0", "httplaxcontentlength=1"}, []string{"asynctimerchan=", "tlsrsakex="}},
 	} {
-		result := DefaultGODEBUG(dir, nil, "", tc.toolchain)
+		result := DefaultGODEBUG(dir, nil, "", tc.toolchain, "")
 		for _, w := range tc.want {
 			if !contains(result, w) {
 				t.Errorf("toolchain %q: missing %q in %q", tc.toolchain, w, result)
@@ -112,7 +112,7 @@ func TestDefaultGODEBUG_Go124(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	result := DefaultGODEBUG(dir, nil, "", "go1.26.3")
+	result := DefaultGODEBUG(dir, nil, "", "go1.26.3", "")
 
 	// Go 1.24 — entries with Changed > 24 should be present.
 	// asynctimerchan has Changed: 23, so 24 < 23 is false — should NOT be present.
@@ -134,7 +134,7 @@ func TestDefaultGODEBUG_LatestVersion(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	result := DefaultGODEBUG(dir, nil, "", "go1.26.3")
+	result := DefaultGODEBUG(dir, nil, "", "go1.26.3", "")
 
 	// No entries should have minor < Changed, so result should be empty.
 	if result != "" {
@@ -144,7 +144,7 @@ func TestDefaultGODEBUG_LatestVersion(t *testing.T) {
 
 func TestDefaultGODEBUG_NoGoMod(t *testing.T) {
 	dir := t.TempDir()
-	result := DefaultGODEBUG(dir, nil, "", "go1.26.3")
+	result := DefaultGODEBUG(dir, nil, "", "go1.26.3", "")
 	if result != "" {
 		t.Errorf("expected empty result when no go.mod, got %q", result)
 	}
@@ -157,7 +157,7 @@ func TestDefaultGODEBUG_GodebugDirective(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	result := DefaultGODEBUG(dir, nil, "", "go1.26.3")
+	result := DefaultGODEBUG(dir, nil, "", "go1.26.3", "")
 
 	// asynctimerchan should be overridden to 0 by the explicit godebug directive.
 	if !contains(result, "asynctimerchan=0") {
@@ -173,7 +173,7 @@ func TestDefaultGODEBUG_DefaultDirective(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	result := DefaultGODEBUG(dir, nil, "", "go1.26.3")
+	result := DefaultGODEBUG(dir, nil, "", "go1.26.3", "")
 
 	// With default go1.24, asynctimerchan (Changed: 23) should NOT be present
 	// because 24 < 23 is false.
@@ -229,7 +229,7 @@ func TestDefaultGODEBUG_ExplicitSurvivesLaterDefault(t *testing.T) {
 			if err := os.WriteFile(filepath.Join(dir, "go.mod"), []byte(tt.gomod), 0o644); err != nil {
 				t.Fatal(err)
 			}
-			result := DefaultGODEBUG(dir, nil, "", "go1.26.3")
+			result := DefaultGODEBUG(dir, nil, "", "go1.26.3", "")
 			for k, v := range tt.want {
 				if !contains(result, k+"="+v) {
 					t.Errorf("expected %s=%s in %q", k, v, result)
@@ -251,7 +251,7 @@ func TestDefaultGODEBUG_NoGoDirective(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	result := DefaultGODEBUG(dir, nil, "", "go1.26.3")
+	result := DefaultGODEBUG(dir, nil, "", "go1.26.3", "")
 
 	// gover.FromGoMod falls back to DefaultGoModVersion = "1.16", so every
 	// table entry with Changed > 16 applies. Spot-check a few across the
@@ -274,7 +274,7 @@ func TestDefaultGODEBUG_SourceDirectives(t *testing.T) {
 		{Key: "panicnil", Value: "1"},
 		{Key: "httpmuxgo121", Value: "1"},
 	}
-	result := DefaultGODEBUG(dir, src, "", "go1.26.3")
+	result := DefaultGODEBUG(dir, src, "", "go1.26.3", "")
 
 	// Source directive overrides go.mod for the same key.
 	if !contains(result, "panicnil=1") {
@@ -298,14 +298,14 @@ func TestDefaultGODEBUG_FIPS140(t *testing.T) {
 
 	// Unset and "off" must not add fips140.
 	for _, v := range []string{"", "off"} {
-		if got := DefaultGODEBUG(dir, nil, v, "go1.26.3"); contains(got, "fips140=") {
+		if got := DefaultGODEBUG(dir, nil, v, "go1.26.3", ""); contains(got, "fips140=") {
 			t.Errorf("GOFIPS140=%q must not add fips140; got %q", v, got)
 		}
 	}
 
 	// "latest" (and any other non-off value) adds fips140=on.
 	for _, v := range []string{"latest", "v1.0.0"} {
-		if got := DefaultGODEBUG(dir, nil, v, "go1.26.3"); !contains(got, "fips140=on") {
+		if got := DefaultGODEBUG(dir, nil, v, "go1.26.3", ""); !contains(got, "fips140=on") {
 			t.Errorf("GOFIPS140=%q must add fips140=on; got %q", v, got)
 		}
 	}
@@ -316,7 +316,7 @@ func TestDefaultGODEBUG_FIPS140(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(dir, "go.mod"), []byte(gomod2), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if got := DefaultGODEBUG(dir, nil, "latest", "go1.26.3"); !contains(got, "fips140=off") {
+	if got := DefaultGODEBUG(dir, nil, "latest", "go1.26.3", ""); !contains(got, "fips140=off") {
 		t.Errorf("go.mod godebug must override GOFIPS140-derived fips140=on; got %q", got)
 	}
 }
@@ -329,7 +329,7 @@ func TestDefaultGODEBUG_SourceDefaultDirective(t *testing.T) {
 	}
 
 	// //go:debug default=go1.24 in source overrides go.mod's go 1.21.
-	result := DefaultGODEBUG(dir, []Godebug{{Key: "default", Value: "go1.24"}}, "", "go1.26.3")
+	result := DefaultGODEBUG(dir, []Godebug{{Key: "default", Value: "go1.24"}}, "", "go1.26.3", "")
 
 	if contains(result, "asynctimerchan=") {
 		t.Errorf("asynctimerchan should not be present with source default=go1.24; got %q", result)

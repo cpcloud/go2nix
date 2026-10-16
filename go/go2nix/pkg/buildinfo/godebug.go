@@ -3,13 +3,18 @@ package buildinfo
 import (
 	"errors"
 	"fmt"
+	"go/ast"
 	"go/build"
+	"go/parser"
+	"go/token"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"regexp"
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 
 	"golang.org/x/mod/modfile"
 )
@@ -80,7 +85,9 @@ type godebugEntry struct {
 	Removed int    // minor version that removed the setting (0 = still present)
 }
 
-// godebugTable is copied from internal/godebugs/table.go.
+// godebugTable is copied from internal/godebugs/table.go. DefaultGODEBUG
+// reads the table of the toolchain it drives when it can (toolchainTable);
+// this copy is what it falls back on.
 // Only entries with Changed > 0 are included since those are the only ones
 // that affect the default GODEBUG string.
 //
@@ -106,6 +113,7 @@ var godebugTable = []godebugEntry{
 	{Name: "httplaxcontentlength", Changed: 22, Old: "1"},
 	{Name: "httpmuxgo121", Changed: 22, Old: "1"},
 	{Name: "httpservecontentkeepheaders", Changed: 23, Old: "1"},
+	{Name: "httpservecontentmaxranges", Changed: 26, Old: "1"},
 	{Name: "multipathtcp", Changed: 24, Old: "0"},
 	{Name: "netedns0", Changed: 19, Old: "0"},
 	{Name: "panicnil", Changed: 21, Old: "1"},
@@ -142,15 +150,19 @@ var godebugTable = []godebugEntry{
 // including default=. goFips140 is the GOFIPS140 build setting; when
 // Fips140Enabled, fips140=on is added with lower precedence than go.mod
 // and source directives (cmd/go/internal/load/godebug.go:68).
-// toolchainVersion is the version of the Go toolchain go2nix is driving
-// (the `go env GOVERSION` string, e.g. "go1.26.3"). The table is a superset
-// over toolchains, so an entry counts only if that toolchain's own
-// internal/godebugs table would carry it: not yet added (Changed after the
-// toolchain) and already retired (Removed at or before it) are both
-// skipped, as its cmd/go would. An unparseable or empty value is treated
-// as the newest release: nothing is too new, every retired entry is
-// skipped.
-func DefaultGODEBUG(moduleRoot string, srcDirectives []Godebug, goFips140, toolchainVersion string) string {
+// goroot is the GOROOT of the Go toolchain go2nix is driving. The defaults
+// come from that toolchain's own internal/godebugs table, the one its
+// cmd/go walks, so a setting a patch release added or one that toolchain
+// has retired needs no rule here.
+//
+// When goroot is empty or its table cannot be read, godebugTable stands in
+// and toolchainVersion (the `go env GOVERSION` string, e.g. "go1.26.3")
+// decides which of its entries count. That table is a superset over
+// toolchains told apart by minor version only, so an entry counts unless
+// it is not yet added (Changed after the toolchain) or already retired
+// (Removed at or before it). An unparseable or empty value is treated as
+// the newest release: nothing is too new, every retired entry is skipped.
+func DefaultGODEBUG(moduleRoot string, srcDirectives []Godebug, goFips140, toolchainVersion, goroot string) string {
 	goModPath := filepath.Join(moduleRoot, "go.mod")
 	data, err := os.ReadFile(goModPath)
 	if err != nil {
@@ -200,21 +212,26 @@ func DefaultGODEBUG(moduleRoot string, srcDirectives []Godebug, goFips140, toolc
 	}
 
 	// Build defaults map: for each godebug entry where the effective
-	// go version < Changed, use the old value — but only for entries the
-	// toolchain in use actually carries (cmd/go walks its own
-	// godebugs.All): a setting it predates is not emitted, and neither is
-	// one it has retired.
+	// go version < Changed, use the old value. cmd/go walks its own
+	// godebugs.All, so with the driven toolchain's table that is the whole
+	// rule; with the copy, skip what that toolchain predates or has retired.
+	table, own := toolchainTable(goroot)
+	if !own {
+		table = godebugTable
+	}
 	toolchainMinor := parseGoMinor(strings.TrimPrefix(toolchainVersion, "go"))
 	m := make(map[string]string)
-	for _, entry := range godebugTable {
+	for _, entry := range table {
 		if minor >= entry.Changed {
 			continue
 		}
-		if toolchainMinor >= 0 && toolchainMinor < entry.Changed {
-			continue
-		}
-		if entry.Removed > 0 && (toolchainMinor < 0 || toolchainMinor >= entry.Removed) {
-			continue
+		if !own {
+			if toolchainMinor >= 0 && toolchainMinor < entry.Changed {
+				continue
+			}
+			if entry.Removed > 0 && (toolchainMinor < 0 || toolchainMinor >= entry.Removed) {
+				continue
+			}
 		}
 		m[entry.Name] = entry.Old
 	}
@@ -252,6 +269,100 @@ func DefaultGODEBUG(moduleRoot string, srcDirectives []Godebug, goFips140, toolc
 		fmt.Fprintf(&b, "%s=%s", k, m[k])
 	}
 	return b.String()
+}
+
+var toolchainTables sync.Map // goroot -> []godebugEntry, nil when unreadable
+
+// toolchainTable returns the entries of godebugs.All with Changed > 0 from
+// internal/godebugs/table.go under goroot. That file is part of every
+// GOROOT the standard library is compiled from. ok is false when goroot is
+// empty, which the callers report, or when the file cannot be read as such
+// a table, which is logged the first time that goroot is asked for.
+func toolchainTable(goroot string) (entries []godebugEntry, ok bool) {
+	if goroot == "" {
+		return nil, false
+	}
+	if v, loaded := toolchainTables.Load(goroot); loaded {
+		entries, _ = v.([]godebugEntry)
+		return entries, entries != nil
+	}
+	path := filepath.Join(goroot, "src", "internal", "godebugs", "table.go")
+	entries, err := parseGodebugsAll(path)
+	if err != nil {
+		slog.Warn("default GODEBUG falls back on the built-in table", "err", err)
+		entries = nil
+	}
+	toolchainTables.Store(goroot, entries)
+	return entries, entries != nil
+}
+
+// parseGodebugsAll reads `var All = []Info{...}` from a godebugs table.go.
+func parseGodebugsAll(path string) ([]godebugEntry, error) {
+	f, err := parser.ParseFile(token.NewFileSet(), path, nil, parser.SkipObjectResolution)
+	if err != nil {
+		return nil, err
+	}
+	var all *ast.CompositeLit
+	for _, decl := range f.Decls {
+		gd, ok := decl.(*ast.GenDecl)
+		if !ok || gd.Tok != token.VAR {
+			continue
+		}
+		for _, spec := range gd.Specs {
+			vs, ok := spec.(*ast.ValueSpec)
+			if ok && len(vs.Names) == 1 && vs.Names[0].Name == "All" && len(vs.Values) == 1 {
+				all, _ = vs.Values[0].(*ast.CompositeLit)
+			}
+		}
+	}
+	if all == nil {
+		return nil, fmt.Errorf("%s: no `var All = []Info{...}`", path)
+	}
+	var entries []godebugEntry
+	for _, elt := range all.Elts {
+		info, ok := elt.(*ast.CompositeLit)
+		if !ok {
+			return nil, fmt.Errorf("%s: an element of All is not a composite literal", path)
+		}
+		var e godebugEntry
+		for _, field := range info.Elts {
+			kv, ok := field.(*ast.KeyValueExpr)
+			if !ok {
+				return nil, fmt.Errorf("%s: an Info without field names", path)
+			}
+			key, _ := kv.Key.(*ast.Ident)
+			if key == nil || (key.Name != "Name" && key.Name != "Old" && key.Name != "Changed") {
+				continue
+			}
+			// A value this cannot read would leave a table with a row
+			// short, served as the toolchain's own.
+			lit, _ := kv.Value.(*ast.BasicLit)
+			if lit == nil {
+				return nil, fmt.Errorf("%s: %s of %q is not a literal", path, key.Name, e.Name)
+			}
+			switch key.Name {
+			case "Name":
+				e.Name, err = strconv.Unquote(lit.Value)
+			case "Old":
+				e.Old, err = strconv.Unquote(lit.Value)
+			case "Changed":
+				e.Changed, err = strconv.Atoi(lit.Value)
+			}
+			if err != nil {
+				return nil, fmt.Errorf("%s: %s of %q: %w", path, key.Name, e.Name, err)
+			}
+		}
+		if e.Name == "" {
+			return nil, fmt.Errorf("%s: an Info without a Name", path)
+		}
+		if e.Changed > 0 {
+			entries = append(entries, e)
+		}
+	}
+	if len(entries) == 0 {
+		return nil, fmt.Errorf("%s: All has no entry with Changed set", path)
+	}
+	return entries, nil
 }
 
 var goMinorRe = regexp.MustCompile(`^1\.(\d+)`)
