@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
-	"os/exec"
 	"strings"
 
 	"github.com/numtide/go2nix/pkg/buildinfo"
@@ -32,12 +31,11 @@ func runModinfoCmd(args []string) {
 	if gobin == "" {
 		gobin = "go"
 	}
-	out, err := exec.Command(gobin, "env", "GOVERSION").Output()
+	goVersion, goroot, err := goToolchain(gobin)
 	if err != nil {
-		slog.Error("go env GOVERSION failed", "err", err)
+		slog.Error("go env GOVERSION GOROOT failed", "err", err)
 		os.Exit(1)
 	}
-	goVersion := strings.TrimSpace(string(out))
 
 	// Read lockfile for dependency modules.
 	lock, err := lockfile.Read(*lockfilePath)
@@ -71,7 +69,7 @@ func runModinfoCmd(args []string) {
 	}
 	srcDirectives := buildinfo.ParseSourceGodebugs(nil, srcDir)
 	goFips140 := compile.GoEnvVar("GOFIPS140")
-	godebug := buildinfo.DefaultGODEBUG(moduleRoot, srcDirectives, goFips140, goVersion)
+	godebug := buildinfo.DefaultGODEBUG(moduleRoot, srcDirectives, goFips140, goVersion, goroot)
 
 	goos := compile.GoEnvVar("GOOS")
 	goarch := compile.GoEnvVar("GOARCH")
