@@ -3,5 +3,5 @@
 # file says when to regenerate.
 testify-basic /nix/store/mlfy1sxk8vpwyslgm5h5h6jfiw2ma3g7-testify-basic-0.0.1.drv
 xtest-local-dep /nix/store/dph6225i6rraxzax1q61sg959j3jnwg2-xtest-local-dep-0.0.1.drv
-cgo-internal-test /nix/store/wc9q8z0vzy7kiagvjn57n31xi17afxqa-cgo-internal-test-0.0.1.drv
+cgo-internal-test /nix/store/vrd59l1h1y866ycq9dqil96v18ljlf19-cgo-internal-test-0.0.1.drv
 torture-app-full /nix/store/kcrqqm4dmz6wbm4kfyf3isglaw12wmb6-torture-app-full-0.0.1.drv
