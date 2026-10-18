@@ -314,7 +314,12 @@ let
         version = 2;
         kind = "compile";
         importcfgParts = [ "${stdlib}/importcfg" ] ++ map depCompileCfg deps;
-        inherit tags;
+        # The plugin selected the files with these tags at eval time;
+        # compile-package reads them only for `#cgo` lines in cgo files.
+        # Writing them for a pure-Go package would give it a different
+        # derivation per tag set, so applications that differ only in tags
+        # would share none of their pure-Go packages.
+        tags = if (files.cgoFiles or [ ]) != [ ] then tags else [ ];
         gcflags =
           let
             base = gcflags;

@@ -236,6 +236,10 @@
           cargo-clippy-go2nix-nix-plugin = callPkg ./packages/cargo-clippy-go2nix-nix-plugin/default.nix;
           check-godebug-table = callPkg ./packages/check-godebug-table/default.nix;
           cross-platform-env = callPkgWith ./tests/nix/cross_platform_test.nix { inherit pkgs; };
+          compile-manifest-tags = callPkgWith ./tests/nix/compile_manifest_tags_test.nix {
+            flake = self;
+            inherit system;
+          };
           # tests/nix/{helpers,fetch_go_module}_test.nix return `true` or
           # throw. seq forces them at eval time so a failure breaks the
           # check; the runCommand body is just the success marker.

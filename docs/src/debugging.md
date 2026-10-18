@@ -98,9 +98,11 @@ directory for a local one. The manifest has the rest: `files` (exactly which
 files `go list` selected for this platform and tag set, by kind: `goFiles`,
 `cgoFiles`, `sFiles`, `cFiles`, `cxxFiles`, `hFiles`, `sysoFiles`, …, and
 `embedPatterns`), `importcfgParts` (the import maps of its dependencies),
-`tags`, `gcflags`, `pgoProfile`. If a file you expected is not in `files`, a
-build constraint excluded it (above, `color_windows.go` on Linux), and the
-question is about `tags`, `GOOS`/`GOARCH` or `CGO_ENABLED`, not about go2nix.
+`tags` (only for a package with `cgoFiles`, where they decide which `#cgo`
+lines apply; empty otherwise), `gcflags`, `pgoProfile`. If a file you
+expected is not in `files`, a build constraint excluded it (above,
+`color_windows.go` on Linux), and the question is about `tags`,
+`GOOS`/`GOARCH` or `CGO_ENABLED`, not about go2nix.
 
 The application derivation has `linkManifestJSON` and, with `doCheck`,
 `testManifestJSON` in the same way.
