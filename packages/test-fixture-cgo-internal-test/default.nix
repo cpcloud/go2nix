@@ -47,10 +47,13 @@ else
       echo "=== Asserting srcOverlay won over source-tree embeds (cgo + raw paths) ==="
       banner=$(echo "$output" | sed -n 2p)
       version=$(echo "$output" | sed -n 3p)
+      commit=$(echo "$output" | sed -n 4p)
       [ "$banner" = "hello-from-overlay" ] \
         || { echo "FAIL: adder.Banner() = '$banner', want hello-from-overlay (cgo srcOverlay path)"; exit 1; }
       [ "$version" = "v1.2.3-overlay" ] \
         || { echo "FAIL: stamp.Version = '$version', want v1.2.3-overlay (rawGoCompile srcOverlay path)"; exit 1; }
+      [ "$commit" = "abc123-overlay" ] \
+        || { echo "FAIL: stamp.Commit = '$commit', want abc123-overlay (embed only the overlay supplies)"; exit 1; }
 
       echo "=== Asserting purebin (built after a cgo subPackage) is statically linked ==="
       [ "$($result/bin/purebin)" = "pure" ] || { echo "FAIL: purebin output"; exit 1; }

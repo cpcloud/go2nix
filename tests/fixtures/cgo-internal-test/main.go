@@ -19,4 +19,5 @@ func main() {
 	fmt.Println(adder.Add(2, 3) * int(C.one()))
 	fmt.Println(adder.Banner())
 	fmt.Println(stamp.Version)
+	fmt.Println(stamp.Commit)
 }
