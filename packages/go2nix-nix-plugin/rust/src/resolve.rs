@@ -7,8 +7,10 @@ use anyhow::{anyhow, bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
-use std::path::Path;
+use std::ffi::OsString;
+use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::{Arc, Mutex};
 
 /// Baked-in default Go binary path, set at compile time via GO2NIX_DEFAULT_GO.
 /// `option_env!` (not `env!`) so the plugin still compiles when the var is unset;
@@ -645,6 +647,18 @@ fn run_go_list_test(
     patterns: &[String],
     opts: &GoListOpts,
 ) -> Result<Vec<u8>> {
+    go_list_test_output(
+        go_bin,
+        go_list_test_command(go_bin, src_dir, patterns, opts),
+    )
+}
+
+fn go_list_test_command(
+    go_bin: &str,
+    src_dir: &str,
+    patterns: &[String],
+    opts: &GoListOpts,
+) -> Command {
     let mut cmd = Command::new(go_bin);
     cmd.arg("list");
     cmd.arg("-json=ImportPath,Dir,Module,Imports,TestImports,XTestImports,GoFiles,CgoFiles,SFiles,CFiles,CXXFiles,MFiles,FFiles,HFiles,SysoFiles,SwigFiles,SwigCXXFiles,EmbedPatterns,EmbedFiles,TestGoFiles,XTestGoFiles,TestEmbedFiles,XTestEmbedFiles,TestEmbedPatterns,XTestEmbedPatterns,CgoPkgConfig,CgoCFLAGS,CgoLDFLAGS,ForTest,Match,InvalidGoFiles,Error");
@@ -665,7 +679,10 @@ fn run_go_list_test(
     }
 
     configure_go_env(&mut cmd, src_dir, opts);
+    cmd
+}
 
+fn go_list_test_output(go_bin: &str, mut cmd: Command) -> Result<Vec<u8>> {
     let output = cmd
         .output()
         .with_context(|| format!("resolveGoPackages: failed to execute '{go_bin}'"))?;
@@ -681,6 +698,121 @@ fn run_go_list_test(
     }
 
     Ok(output.stdout)
+}
+
+/// Everything that decides what a `go list` process prints apart from the
+/// files it reads: program, arguments, working directory and, because
+/// `configure_go_env` clears the inherited one, the whole environment; and
+/// where the module roots resolve to, because `src` can be a symlink outside
+/// the store that points into it.
+#[derive(PartialEq, Eq)]
+struct ListingKey {
+    roots: Vec<PathBuf>,
+    dir: Option<PathBuf>,
+    program: OsString,
+    args: Vec<OsString>,
+    env: Vec<(OsString, Option<OsString>)>,
+}
+
+impl ListingKey {
+    fn of(cmd: &Command, roots: Vec<PathBuf>) -> Self {
+        ListingKey {
+            roots,
+            dir: cmd.get_current_dir().map(|d| d.to_owned()),
+            program: cmd.get_program().to_owned(),
+            args: cmd.get_args().map(|a| a.to_owned()).collect(),
+            env: cmd
+                .get_envs()
+                .map(|(k, v)| (k.to_owned(), v.map(|v| v.to_owned())))
+                .collect(),
+        }
+    }
+}
+
+/// The output of `go list -deps -test` runs kept for later calls of this
+/// process, least recently used first. The sizes add up to at most `limit`
+/// bytes: the least recently used listings are dropped to make room, and one
+/// that alone is larger is not kept.
+struct ListingMemo {
+    limit: usize,
+    kept: Vec<(ListingKey, Arc<Vec<u8>>)>,
+}
+
+impl ListingMemo {
+    const fn new(limit: usize) -> Self {
+        ListingMemo {
+            limit,
+            kept: Vec::new(),
+        }
+    }
+
+    fn get(&mut self, key: &ListingKey) -> Option<Arc<Vec<u8>>> {
+        let i = self.kept.iter().position(|(k, _)| k == key)?;
+        let entry = self.kept.remove(i);
+        let stdout = Arc::clone(&entry.1);
+        self.kept.push(entry);
+        Some(stdout)
+    }
+
+    fn put(&mut self, key: ListingKey, stdout: Arc<Vec<u8>>) {
+        if stdout.len() > self.limit {
+            return;
+        }
+        self.kept.retain(|(k, _)| *k != key);
+        self.kept.push((key, stdout));
+        let mut total: usize = self.kept.iter().map(|(_, s)| s.len()).sum();
+        while total > self.limit {
+            total -= self.kept.remove(0).1.len();
+        }
+    }
+}
+
+/// Bytes of listings one evaluator process keeps at most.
+const LISTINGS_LIMIT: usize = 64 << 20;
+
+static LISTINGS: Mutex<ListingMemo> = Mutex::new(ListingMemo::new(LISTINGS_LIMIT));
+
+/// `path` with symlinks resolved, when that lies inside `store`: a store path
+/// does not change while the process lives, anything else can be edited
+/// between two calls of a `nix repl` or a language server.
+fn resolved_in_store(store: &Path, path: &Path) -> Option<PathBuf> {
+    let path = std::fs::canonicalize(path).ok()?;
+    (path != store && path.starts_with(store)).then_some(path)
+}
+
+/// Whether a later call can be served `records`, the listing of the modules
+/// at `roots`. A record with an error can read differently once the module
+/// cache has what it lacked. What go read through a symlink out of the store
+/// can change although the store path does not, so the module roots (for
+/// go.mod) and the directories of the local packages must hold no such link.
+fn listing_can_be_kept(store: &Path, roots: &[PathBuf], records: &[GoPackage]) -> bool {
+    if records
+        .iter()
+        .any(|p| p.error.as_ref().is_some_and(|e| !e.err.is_empty()))
+    {
+        return false;
+    }
+    let local = |m: &GoModule| {
+        m.main
+            || m.replace
+                .as_ref()
+                .is_some_and(|r| !r.path.is_empty() && r.version.is_empty())
+    };
+    let dirs: BTreeSet<&Path> = records
+        .iter()
+        .filter(|p| p.module.as_ref().is_some_and(local))
+        .map(|p| Path::new(&p.dir))
+        .chain(roots.iter().map(PathBuf::as_path))
+        .collect();
+    dirs.into_iter().all(|dir| {
+        resolved_in_store(store, dir).is_some()
+            && std::fs::read_dir(dir).is_ok_and(|entries| {
+                entries.flatten().all(|e| {
+                    !e.file_type().is_ok_and(|t| t.is_symlink())
+                        || resolved_in_store(store, &e.path()).is_some()
+                })
+            })
+    })
 }
 
 struct TestPassResult {
@@ -1289,6 +1421,10 @@ pub(crate) struct JsonInput {
     /// [`overlay_supplies`].
     #[serde(default)]
     src_overlays: BTreeMap<String, bool>,
+    /// Where the evaluator's store paths are on disk. The Nix shim sets it
+    /// whatever the expression passed.
+    #[serde(default)]
+    store_dir: Option<String>,
 }
 
 fn default_sub_packages() -> Vec<String> {
@@ -1452,19 +1588,43 @@ fn resolve_single_pass(go_bin: &str, input: &JsonInput, opts: &GoListOpts) -> Op
         return None;
     }
     // Only the main module's replace directives apply.
-    let go_mod = Path::new(&input.src).join(&input.mod_root).join("go.mod");
-    let siblings: BTreeSet<String> = std::fs::read_to_string(go_mod)
+    let work_dir = Path::new(&input.src).join(&input.mod_root);
+    let replaces = std::fs::read_to_string(work_dir.join("go.mod"))
         .map(|text| parse_local_replaces(&text))
-        .unwrap_or_default()
-        .into_iter()
-        .map(|(mod_path, _)| mod_path)
-        .collect();
+        .unwrap_or_default();
+    let siblings: BTreeSet<String> = replaces.iter().map(|(m, _)| m.clone()).collect();
 
-    let stdout = run_go_list_test(go_bin, &input.src, &test_patterns(&siblings), opts).ok()?;
+    // The patterns do not depend on the subPackages, so every call of an
+    // evaluation over this module runs this command. Its output is kept when
+    // the module and the directories that replace others are in the store.
+    let cmd = go_list_test_command(go_bin, &input.src, &test_patterns(&siblings), opts);
+    let store = input
+        .store_dir
+        .as_deref()
+        .and_then(|s| std::fs::canonicalize(s).ok());
+    let key = store.as_deref().and_then(|store| {
+        std::iter::once(work_dir.clone())
+            .chain(replaces.iter().map(|(_, dir)| work_dir.join(dir)))
+            .map(|root| resolved_in_store(store, &root))
+            .collect::<Option<Vec<_>>>()
+            .map(|roots| ListingKey::of(&cmd, roots))
+    });
+    let kept = key.as_ref().and_then(|k| LISTINGS.lock().ok()?.get(k));
+    let stdout = match &kept {
+        Some(stdout) => Arc::clone(stdout),
+        None => Arc::new(go_list_test_output(go_bin, cmd).ok()?),
+    };
     let records: Vec<GoPackage> = serde_json::Deserializer::from_slice(&stdout)
         .into_iter::<GoPackage>()
         .collect::<std::result::Result<_, _>>()
         .ok()?;
+    if let (Some(store), Some(key), None) = (store, key, kept) {
+        if listing_can_be_kept(&store, &key.roots, &records) {
+            if let Ok(mut listings) = LISTINGS.lock() {
+                listings.put(key, stdout);
+            }
+        }
+    }
 
     let build = build_closure(&records, &input.sub_packages)?;
     let mut graph = classify_go_packages(
@@ -2324,6 +2484,7 @@ mod tests {
             cgo_enabled: String::new(),
             resolve_hashes: false,
             src_overlays: BTreeMap::new(),
+            store_dir: None,
         };
         let json = package_graph_to_json(&graph, &input, hashes).unwrap();
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
@@ -2997,10 +3158,15 @@ mod tests {
             .and_then(|(_, v)| v.map(|v| v.to_string_lossy().into_owned()))
     }
 
+    /// Held by the test that changes the environment and by those that count `go` runs: the inherited variables
+    /// are part of `ListingKey`.
+    static ENV: Mutex<()> = Mutex::new(());
+
     // One test (not two) because std::env mutation is process-global and the
     // default cargo test harness runs tests in parallel.
     #[test]
     fn configure_go_env_goproxy_netrc_inherit_and_override() {
+        let _env = ENV.lock().unwrap_or_else(|e| e.into_inner());
         std::env::set_var("GOPROXY", "https://proxy.example/");
         std::env::set_var("NETRC", "/tmp/netrc-test");
 
@@ -3951,43 +4117,346 @@ mod tests {
         assert!(!err.contains("example.com/m/ui:"), "{err}");
     }
 
-    /// With doCheck one `go list` process serves the call.
+    /// A stand-in for `go` at `path` that notes its first argument in `<path>.calls` and then runs `body`.
+    #[cfg(unix)]
+    fn go_script(path: &std::path::Path, body: &str) {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::write(
+            path,
+            format!("#!/bin/sh\necho \"$1\" >> \"$0.calls\"\n{body}\n"),
+        )
+        .unwrap();
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        // A child another test forked while the script was open for writing holds that descriptor until it
+        // execs; until then running the script fails with ETXTBSY.
+        while let Err(e) = Command::new(path).arg("version").output() {
+            assert_eq!(e.kind(), std::io::ErrorKind::ExecutableFileBusy, "{e}");
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+
+    /// A stand-in that prints `stream`, by shell builtins alone: go runs with next to no environment, PATH
+    /// included.
+    #[cfg(unix)]
+    fn go_printing(path: &std::path::Path, stream: &str) {
+        std::fs::write(format!("{}.stream", path.display()), format!("{stream}\n")).unwrap();
+        go_script(
+            path,
+            "while IFS= read -r line; do printf '%s\\n' \"$line\"; done < \"$0.stream\"",
+        );
+    }
+
+    /// What `resolve_packages` ran of the stand-in `go` for `input`.
+    #[cfg(unix)]
+    fn calls_of(go: &std::path::Path, input: &JsonInput) -> Vec<String> {
+        let log = format!("{}.calls", go.display());
+        std::fs::write(&log, "").unwrap();
+        resolve_packages(input).unwrap();
+        let log = std::fs::read_to_string(&log).unwrap();
+        log.lines().map(str::to_owned).collect()
+    }
+
+    /// With doCheck one `go list` process serves the call, and over a tree in the store it serves the calls
+    /// after it too, with the answer a tree outside the store gets from its own run.
     #[test]
     #[cfg(unix)]
     fn do_check_runs_go_list_once() {
-        use std::os::unix::fs::PermissionsExt;
         let Some(go) = DEFAULT_GO else {
             eprintln!("skip: GO2NIX_DEFAULT_GO unset at build time");
             return;
         };
+        let _env = ENV.lock().unwrap_or_else(|e| e.into_inner());
         let dir = tempfile::tempdir().unwrap();
         let src = dir.path().join("src");
         write_tree(&src, SIBLINGS_TREE);
-        let log = dir.path().join("go.calls");
         let wrapper = dir.path().join("go");
-        std::fs::write(
-            &wrapper,
-            format!("#!/bin/sh\necho \"$1\" >> \"$0.calls\"\nexec '{go}' \"$@\"\n"),
-        )
-        .unwrap();
-        std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755)).unwrap();
-        // A child another test forked while the script was open for writing holds that descriptor until it
-        // execs; until then running the script fails with ETXTBSY.
-        while let Err(e) = Command::new(&wrapper).arg("version").output() {
-            assert_eq!(e.kind(), std::io::ErrorKind::ExecutableFileBusy, "{e}");
-            std::thread::sleep(std::time::Duration::from_millis(10));
-        }
+        go_script(&wrapper, &format!("exec '{go}' \"$@\""));
         let calls = |sub_packages: &[&str], do_check: bool| -> Vec<String> {
-            std::fs::write(&log, "").unwrap();
             let mut input = check_input(wrapper.to_str().unwrap(), &src, sub_packages);
             input.do_check = do_check;
-            resolve_packages(&input).unwrap();
-            let log = std::fs::read_to_string(&log).unwrap();
-            log.lines().map(str::to_owned).collect()
+            calls_of(&wrapper, &input)
         };
         assert_eq!(calls(&["./cmd/app"], true), ["list"]);
         assert_eq!(calls(&["./cmd/app"], false), ["list"]);
         // a root `./...` does not match costs the run that found that out
         assert_eq!(calls(&["./_tools/gen"], true), ["list", "list", "list"]);
+
+        let store = dir.path().join("store");
+        let stored = store.join("0000-source");
+        write_tree(&stored, SIBLINGS_TREE);
+        let json = |src: &std::path::Path, sub_packages: &[&str]| -> (Vec<String>, String) {
+            let mut input = check_input(wrapper.to_str().unwrap(), src, sub_packages);
+            input.store_dir = Some(store.to_str().unwrap().to_owned());
+            let calls = calls_of(&wrapper, &input);
+            let graph = resolve_packages(&input).unwrap();
+            let json = package_graph_to_json(&graph, &input, BTreeMap::new()).unwrap();
+            (calls, json)
+        };
+        let mut runs = Vec::new();
+        for sub_packages in [
+            &["./cmd/app"][..],
+            &["./pkg/other"],
+            &["./cmd/app", "./pkg/other"],
+            &["./internal/lib", "./internal/xhelp"],
+        ] {
+            let (calls, kept) = json(&stored, sub_packages);
+            runs.extend(calls);
+            let (calls, fresh) = json(&src, sub_packages);
+            assert_eq!(calls, ["list"], "{sub_packages:?}");
+            assert_eq!(kept, fresh, "{sub_packages:?}");
+        }
+        assert_eq!(runs, ["list"]);
+    }
+
+    /// Two commands with a library each; `shared_stream` is what go would list for them at `src`.
+    const SHARED_TREE: &[(&str, &str)] = &[
+        ("go.mod", "module m\n"),
+        ("cmd/a/a.go", "package main\n"),
+        ("cmd/b/b.go", "package main\n"),
+        ("liba/a.go", "package liba\n"),
+        ("libb/b.go", "package libb\n"),
+    ];
+
+    fn shared_stream(src: &std::path::Path) -> String {
+        let fields = |dir: &str, file: &str, imports: &str| {
+            let src = src.display();
+            format!(
+                r#""Dir":"{src}/{dir}","Imports":[{imports}],"GoFiles":["{file}"],"Match":["./..."]"#
+            )
+        };
+        [
+            rec("m/cmd/a", "m", &fields("cmd/a", "a.go", r#""m/liba""#)),
+            rec("m/cmd/b", "m", &fields("cmd/b", "b.go", r#""m/libb""#)),
+            rec("m/liba", "m", &fields("liba", "a.go", "")),
+            rec("m/libb", "m", &fields("libb", "b.go", "")),
+        ]
+        .join("\n")
+    }
+
+    fn stored_input(
+        go: &std::path::Path,
+        store: &std::path::Path,
+        src: &std::path::Path,
+        sub_packages: &[&str],
+    ) -> JsonInput {
+        let mut input = check_input(go.to_str().unwrap(), src, sub_packages);
+        input.store_dir = Some(store.to_str().unwrap().to_owned());
+        input
+    }
+
+    /// The calls of one process over one module in the store run `go list` once, each still gets the closure
+    /// of its own subPackages, and a call with another setting that reaches go runs it again.
+    #[test]
+    #[cfg(unix)]
+    fn calls_over_a_tree_in_the_store_share_one_listing() {
+        let _env = ENV.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let store = dir.path().join("store");
+        let src = store.join("0000-source");
+        write_tree(&src, SHARED_TREE);
+        write_tree(&src, &[("sub/go.mod", "module m\n")]);
+        // a link that stays in the store is no reason to list again
+        std::os::unix::fs::symlink("../../liba/a.go", src.join("cmd/a/linked.go")).unwrap();
+        let go = dir.path().join("go");
+        go_printing(&go, &shared_stream(&src));
+
+        let mut runs = Vec::new();
+        for (sub_packages, local) in [
+            (&["./cmd/a"][..], &["m/cmd/a", "m/liba"][..]),
+            (&["./cmd/b"], &["m/cmd/b", "m/libb"]),
+            (
+                &["./cmd/a", "./cmd/b"],
+                &["m/cmd/a", "m/cmd/b", "m/liba", "m/libb"],
+            ),
+        ] {
+            let input = stored_input(&go, &store, &src, sub_packages);
+            runs.extend(calls_of(&go, &input));
+            let graph = resolve_packages(&input).unwrap();
+            assert_eq!(graph.local_paths.iter().collect::<Vec<_>>(), local);
+        }
+        assert_eq!(runs, ["list"]);
+
+        let other: [&dyn Fn(&mut JsonInput); 6] = [
+            &|i| i.tags = vec!["t".to_owned()],
+            &|i| i.goos = "darwin".to_owned(),
+            &|i| i.goarch = "arm64".to_owned(),
+            &|i| i.cgo_enabled = "0".to_owned(),
+            &|i| i.go_proxy = Some("https://proxy.invalid".to_owned()),
+            &|i| i.mod_root = "sub".to_owned(),
+        ];
+        for (n, set) in other.iter().enumerate() {
+            let mut input = stored_input(&go, &store, &src, &["./cmd/a"]);
+            set(&mut input);
+            // the toolchain may be asked more than the listing under a setting
+            assert!(calls_of(&go, &input).contains(&"list".to_owned()), "setting {n}");
+            assert!(calls_of(&go, &input).is_empty(), "setting {n}");
+        }
+        // none of them took the place of the first
+        let input = stored_input(&go, &store, &src, &["./cmd/a"]);
+        assert!(calls_of(&go, &input).is_empty());
+
+        // another toolchain
+        let go2 = dir.path().join("go2");
+        go_printing(&go2, &shared_stream(&src));
+        let input = stored_input(&go2, &store, &src, &["./cmd/a"]);
+        assert_eq!(calls_of(&go2, &input), ["list"]);
+    }
+
+    /// Nothing is kept for a tree that can change under the process: one outside the store, one no store is
+    /// named for, one reached through a symlink out of the store, one whose go.mod replaces a module with a
+    /// directory outside the store, one with a source file or a go.mod that is a symlink out of the store;
+    /// nor a listing with an error in it. A `src` that is a symlink into the store is kept for what it points to.
+    #[test]
+    #[cfg(unix)]
+    fn a_tree_outside_the_store_is_listed_by_every_call() {
+        use std::os::unix::fs::symlink;
+        let _env = ENV.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let store = dir.path().join("store");
+        let src = store.join("0000-source");
+        write_tree(&src, SHARED_TREE);
+        let go = dir.path().join("go");
+        go_printing(&go, &shared_stream(&src));
+        let twice = |go: &std::path::Path, input: &JsonInput, what: &str| {
+            for _ in 0..2 {
+                assert_eq!(calls_of(go, input), ["list"], "{what}");
+            }
+        };
+
+        let live = dir.path().join("live");
+        write_tree(&live, SHARED_TREE);
+        twice(
+            &go,
+            &stored_input(&go, &store, &live, &["./cmd/a"]),
+            "outside the store",
+        );
+
+        let mut input = stored_input(&go, &store, &src, &["./cmd/a"]);
+        input.store_dir = None;
+        twice(&go, &input, "no store named");
+        twice(
+            &go,
+            &stored_input(&go, &store, &store, &["./cmd/a"]),
+            "the store itself",
+        );
+
+        let link = store.join("1111-link");
+        symlink(&live, &link).unwrap();
+        twice(
+            &go,
+            &stored_input(&go, &store, &link, &["./cmd/a"]),
+            "symlink out of the store",
+        );
+
+        let replaced = store.join("2222-source");
+        write_tree(
+            &replaced,
+            &[(
+                "go.mod",
+                "module m\n\nreplace example.com/x => ../../live/x\n",
+            )],
+        );
+        std::fs::create_dir(live.join("x")).unwrap();
+        twice(
+            &go,
+            &stored_input(&go, &store, &replaced, &["./cmd/a"]),
+            "replace out of the store",
+        );
+
+        // a symlink outside the store that points into it can be pointed at another store path
+        let other = store.join("3333-source");
+        write_tree(&other, SHARED_TREE);
+        let result = dir.path().join("result");
+        symlink(&src, &result).unwrap();
+        let input = stored_input(&go, &store, &result, &["./cmd/a"]);
+        assert_eq!(calls_of(&go, &input), ["list"], "symlink into the store");
+        assert!(calls_of(&go, &input).is_empty(), "symlink into the store");
+        std::fs::remove_file(&result).unwrap();
+        symlink(&other, &result).unwrap();
+        assert_eq!(
+            calls_of(&go, &input),
+            ["list"],
+            "symlink into the store, moved"
+        );
+
+        // go reads through a link in a package directory or at a module root, and the store path stays the same
+        // when what is behind it changes
+        for (name, linked) in [("4444-source", "cmd/b/extra.go"), ("5555-source", "go.mod")] {
+            let tree = store.join(name);
+            write_tree(&tree, SHARED_TREE);
+            let _ = std::fs::remove_file(tree.join(linked));
+            symlink(live.join("go.mod"), tree.join(linked)).unwrap();
+            let go = dir.path().join(format!("go-{name}"));
+            go_printing(&go, &shared_stream(&tree));
+            twice(&go, &stored_input(&go, &store, &tree, &["./cmd/a"]), linked);
+        }
+
+        let failing = dir.path().join("go-err");
+        let stream = format!(
+            "{}\n{}",
+            shared_stream(&src),
+            rec(
+                "example.com/nowhere/x",
+                "",
+                r#""Error":{"Err":"no required module provides package example.com/nowhere/x"}"#
+            )
+        );
+        go_printing(&failing, &stream);
+        let input = stored_input(&failing, &store, &src, &["./cmd/a"]);
+        twice(&failing, &input, "a record with an error");
+    }
+
+    #[test]
+    fn listing_key_covers_the_whole_command() {
+        type Change = dyn Fn(&mut Command) -> &mut Command;
+        let key = |change: &Change| {
+            let mut cmd =
+                go_list_test_command("go", "/src", &["./...".to_owned()], &test_opts(Some("off")));
+            change(&mut cmd);
+            ListingKey::of(&cmd, Vec::new())
+        };
+        let same = key(&|c| c);
+        assert!(same == key(&|c| c));
+        let changes: [&Change; 6] = [
+            &|c| c.env("GOMODCACHE", "/elsewhere/mod"),
+            &|c| c.env("GOFLAGS", "-mod=mod"),
+            &|c| c.env_remove("GOFLAGS"),
+            &|c| c.env("HOME", "/elsewhere"),
+            &|c| c.arg("example.com/sibling/..."),
+            &|c| c.current_dir("/src/app"),
+        ];
+        for (n, change) in changes.iter().enumerate() {
+            assert!(same != key(change), "change {n}");
+        }
+        let cmd =
+            go_list_test_command("go", "/src", &["./...".to_owned()], &test_opts(Some("off")));
+        assert!(same != ListingKey::of(&cmd, vec!["/store/0000-source".into()]));
+    }
+
+    #[test]
+    fn listing_memo_drops_the_least_recently_used() {
+        let key = |name: &str| ListingKey::of(Command::new("go").arg(name), Vec::new());
+        let listing = |len: usize| Arc::new(vec![b' '; len]);
+        let mut memo = ListingMemo::new(10);
+        memo.put(key("a"), listing(4));
+        memo.put(key("b"), listing(4));
+        assert!(memo.get(&key("a")).is_some());
+        // 12 bytes with this one: `b`, read longer ago than `a`, goes
+        memo.put(key("c"), listing(4));
+        assert!(memo.get(&key("b")).is_none());
+        assert!(memo.get(&key("c")).is_some());
+        assert!(memo.get(&key("a")).is_some());
+        // too large to keep, and nothing makes room for it
+        memo.put(key("d"), listing(11));
+        assert!(memo.get(&key("d")).is_none());
+        assert!(memo.get(&key("a")).is_some() && memo.get(&key("c")).is_some());
+        // `c` and then `a` make room
+        memo.put(key("e"), listing(10));
+        assert!(memo.get(&key("a")).is_none() && memo.get(&key("c")).is_none());
+        assert_eq!(memo.get(&key("e")).map(|l| l.len()), Some(10));
+        // a second listing under one key replaces the first
+        memo.put(key("e"), listing(3));
+        assert_eq!(memo.get(&key("e")).map(|l| l.len()), Some(3));
+        assert_eq!(memo.kept.len(), 1);
     }
 }

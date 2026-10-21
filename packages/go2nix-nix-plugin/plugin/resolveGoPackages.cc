@@ -101,6 +101,15 @@ static void prim_resolveGoPackages(EvalState &state, const PosIdx pos,
         inputJson["src"] = remapStorePath(*state.store, inputJson["src"].get<std::string>());
     }
 
+    // The resolver keeps what it listed from a source below this directory
+    // for the next call; never let the expression say where that is.
+    if (inputJson.is_object()) {
+        if (inputJson.erase("storeDir") > 0)
+            warn("resolveGoPackages: the 'storeDir' attribute is ignored; the plugin passes the evaluator's own store directory");
+        if (auto *localFS = dynamic_cast<LocalFSStore *>(&*state.store))
+            inputJson["storeDir"] = std::string(localFS->getRealStoreDir());
+    }
+
     auto inputStr = inputJson.dump();
 
     char *resultJson = nullptr;
