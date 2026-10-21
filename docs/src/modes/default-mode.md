@@ -109,8 +109,10 @@ fine-grained package caching.
 
 ### 7. Application derivation
 
-The final derivation receives typed JSON manifests via environment variables
-and uses `goAppHook` (link-go-binary.sh) to invoke the Go CLI:
+The final derivation is a `__structuredAttrs` derivation and receives the
+typed JSON manifests as top-level attributes: shell variables in the build, not
+exported environment variables (Linux refuses an environment string of 128 KiB
+or more). `goAppHook` (link-go-binary.sh) passes them to the Go CLI:
 
 1. **Build phase** — writes `linkManifestJSON` to a file and calls
    `go2nix link-binary --manifest`, which validates the lockfile against

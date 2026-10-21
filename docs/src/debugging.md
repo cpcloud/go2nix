@@ -105,7 +105,8 @@ expected is not in `files`, a build constraint excluded it (above,
 `GOOS`/`GOARCH` or `CGO_ENABLED`, not about go2nix.
 
 The application derivation has `linkManifestJSON` and, with `doCheck`,
-`testManifestJSON` in the same way.
+`testManifestJSON`, readable the same way. They are top-level attributes of
+the derivation, not under `env`.
 
 ## See what `go` sees
 

@@ -286,8 +286,8 @@ let
         args = [ rawGoCompileScript ];
         # compileManifestJSON now carries per-file lists; pass it via a
         # temp file so packages with thousands of source files don't risk
-        # MAX_ARG_STRLEN. (The stdenv/cgo path already avoids this via
-        # __structuredAttrs.)
+        # MAX_ARG_STRLEN. (The stdenv/cgo path keeps it under `env`, which
+        # stdenv exports even under __structuredAttrs.)
         passAsFile = [ "compileManifestJSON" ];
         goPath = "${buildPackages.coreutils}/bin:${go}/bin";
         go2nixBin = "${go2nix}/bin/go2nix";
@@ -1229,13 +1229,14 @@ stdenv.mkDerivation (
     }
     // (args.passthru or { });
 
-    env =
-      goEnv
-      // {
-        inherit linkManifestJSON;
-      }
-      // (if CGO_ENABLED != null then { inherit CGO_ENABLED; } else { })
-      // (if doCheck then { inherit testManifestJSON; } else { })
-      // (args.env or { });
+    env = goEnv // (if CGO_ENABLED != null then { inherit CGO_ENABLED; } else { }) // (args.env or { });
+
+    # The manifests are top-level attributes rather than `env` keys: stdenv
+    # exports every key of `env`, and Linux refuses an execve (E2BIG) when
+    # one environment string is 128 KiB or more, which a few hundred local
+    # packages put in a manifest. Under __structuredAttrs the hook still
+    # sees them as shell variables.
+    inherit linkManifestJSON;
   }
+  // optionalAttrs doCheck { inherit testManifestJSON; }
 )

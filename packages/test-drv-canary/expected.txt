@@ -1,7 +1,7 @@
 # Expected application .drv paths (x86_64-linux) for test-drv-canary.
 # Written by ./scripts/update-drv-canary.sh; default.nix next to this
 # file says when to regenerate.
-testify-basic /nix/store/mlfy1sxk8vpwyslgm5h5h6jfiw2ma3g7-testify-basic-0.0.1.drv
-xtest-local-dep /nix/store/dph6225i6rraxzax1q61sg959j3jnwg2-xtest-local-dep-0.0.1.drv
-cgo-internal-test /nix/store/vrd59l1h1y866ycq9dqil96v18ljlf19-cgo-internal-test-0.0.1.drv
-torture-app-full /nix/store/kcrqqm4dmz6wbm4kfyf3isglaw12wmb6-torture-app-full-0.0.1.drv
+testify-basic /nix/store/x461qxfx7nxiwh8pghk2706qg30lbidg-testify-basic-0.0.1.drv
+xtest-local-dep /nix/store/2fig60z4nnm62vw13ds53zh16skklc32-xtest-local-dep-0.0.1.drv
+cgo-internal-test /nix/store/zkvnxh3cb1n08qyvjddzqq9px0ba4k7y-cgo-internal-test-0.0.1.drv
+torture-app-full /nix/store/diclqiajb31q7c7d4pjp4rw67yzzxfmm-torture-app-full-0.0.1.drv

@@ -55,11 +55,13 @@ evaluate to `true` or throw, and run as `checks.<system>.nix-unit-tests`.
 `compile_manifest_tags_test.nix` is `checks.<system>.compile-manifest-tags`: it
 evaluates a fixture with two tag sets and checks that only the cgo package's
 compile derivation moves. The others
-(`mainsrc_replace_test.nix`, `modroot_dotslash_test.nix`,
-`nested_module_test.nix`, `testmain_badsig_test.nix`) build a fixture and
-assert on derivation paths or on an expected failure; they are the packages
-`test-fixture-mainsrc-replace`, `-modroot-dotslash`, `-nested-module` and
-`-testmain-badsig`.
+(`large_manifest_test.nix`, `mainsrc_replace_test.nix`,
+`modroot_dotslash_test.nix`, `nested_module_test.nix`,
+`testmain_badsig_test.nix`) build a fixture and assert on derivation paths, on
+the result or on an expected failure; they are the packages
+`test-fixture-large-manifest`, `-mainsrc-replace`, `-modroot-dotslash`,
+`-nested-module` and `-testmain-badsig`. `large_manifest_test.nix` generates
+its module (220 packages) instead of reading one from `fixtures/`.
 
 ## `test-ca.sh`
 
