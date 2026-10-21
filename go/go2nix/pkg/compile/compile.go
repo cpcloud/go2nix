@@ -79,9 +79,9 @@ func CompileGoPackage(opts Options) error {
 		opts.GoVersion = findGoVersion(opts.SrcDir)
 	}
 
-	// Compute backend concurrency for go tool compile,
-	// matching cmd/go behavior (gc.go:181-239).
-	opts.concurrency = gcBackendConcurrency()
+	// Compute backend concurrency for go tool compile from the cores Nix
+	// granted and the size of the package.
+	opts.concurrency = gcBackendConcurrency(opts)
 
 	// Compute -trimpath rewrite string matching cmd/go behavior (gc.go:259-310).
 	// Strips build temp dir (TrimPath) for generated files (go_asm.h, symabis, etc.).
@@ -171,7 +171,7 @@ func FindGoVersion(dir string) string {
 // alternative -D LocalPrefix branch only applies to legacy GOPATH-style
 // relative imports, and go2nix only ever compiles module-based packages.
 func baseCompileArgs(opts Options) []string {
-	return []string{
+	args := []string{
 		"tool", "compile",
 		"-importcfg", opts.ImportCfg,
 		"-p", opts.PFlag,
@@ -180,6 +180,12 @@ func baseCompileArgs(opts Options) []string {
 		"-nolocalimports",
 		"-pack",
 	}
+	// Without -c the compiler runs GOMAXPROCS backend workers, so a single
+	// one has to be asked for. The callers pass the values above 1.
+	if opts.concurrency == 1 {
+		args = append(args, "-c=1")
+	}
+	return args
 }
 
 // outputFlags returns the -o / -linkobj arguments. When IfaceOutput is set,

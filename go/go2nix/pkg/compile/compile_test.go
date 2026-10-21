@@ -26,6 +26,13 @@ func TestBaseCompileArgs(t *testing.T) {
 	if !reflect.DeepEqual(args, want) {
 		t.Errorf("baseCompileArgs() = %v, want %v", args, want)
 	}
+
+	for concurrency, want := range map[int]bool{1: true, 4: false} {
+		args := baseCompileArgs(Options{concurrency: concurrency})
+		if got := args[len(args)-1] == "-c=1"; got != want {
+			t.Errorf("baseCompileArgs() with concurrency %d = %v, -c=1 present: %v, want %v", concurrency, args, got, want)
+		}
+	}
 }
 
 func TestOptions_rewriteDir(t *testing.T) {

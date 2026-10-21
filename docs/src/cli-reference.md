@@ -88,6 +88,11 @@ derivation runs it, in both modes: directly from the raw builder for pure-Go
 packages, through the `compile-go-pkg.sh` hook for cgo ones, and from the
 derivations `go2nix resolve` registers in experimental mode.
 
+The compiler's backend concurrency (`-c`) is the number of cores Nix grants
+(`NIX_BUILD_CORES`; unset or `0` means all, and never more than GOMAXPROCS),
+up to 4, and up to 16 for a package with at least 1 MiB of Go source.
+`GO19CONCURRENTCOMPILATION=0` in the derivation's environment makes it 1.
+
 ```
 go2nix compile-package --manifest FILE --import-path PATH --src-dir DIR --output FILE [flags]
 ```
@@ -118,6 +123,15 @@ Link Go application binaries. Reads a link manifest that declares all
 inputs (importcfg parts, local archives, ldflags, etc.), validates the
 lockfile, generates modinfo, compiles main packages, and invokes the
 linker. Used internally by the default mode's build phase.
+
+The main packages of one manifest are compiled and linked concurrently, as
+many at a time as Nix grants cores (`NIX_BUILD_CORES`; unset or `0` means
+all), and each one's log lines and linker output are printed together, in the
+order of the manifest. Compiler diagnostics are not part of that; they go
+straight to the terminal. Peak memory is that of one link times the number
+that run at once (four binaries of 60 MB: about 0.95 GB one at a time, 1.8 GB
+with two cores, 3.5 GB with four); `NIX_BUILD_CORES=1` builds them one at a
+time, in the order of the manifest, and prints the log as it happens.
 
 ```
 go2nix link-binary --manifest FILE --output DIR

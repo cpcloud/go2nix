@@ -9,6 +9,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 
@@ -194,12 +195,42 @@ func LangVersion(v string) string {
 	return major + "." + minor
 }
 
-// gcBackendConcurrency returns the -c flag value for the Go compiler,
-// matching cmd/go/internal/work.gcBackendConcurrency (gc.go:181-239).
-// Enables concurrent backend compilation within a single go tool compile
-// invocation. Capped at min(4, GOMAXPROCS) since go2nix already handles
-// package-level parallelism. Respects GO19CONCURRENTCOMPILATION env var.
-func gcBackendConcurrency() int {
+// BuildCores returns how many CPU-bound jobs this process may run at once: the
+// cores Nix granted the build in NIX_BUILD_CORES, never more than GOMAXPROCS.
+// 0 means all of them, as in nixpkgs' stdenv. So does unset, which Nix never
+// leaves it (stdenv would make that 1).
+func BuildCores() int {
+	return buildCores(os.Getenv("NIX_BUILD_CORES"), runtime.GOMAXPROCS(0))
+}
+
+func buildCores(nixBuildCores string, gomaxprocs int) int {
+	if n, err := strconv.Atoi(nixBuildCores); err == nil && n > 0 && n < gomaxprocs {
+		return n
+	}
+	return gomaxprocs
+}
+
+const (
+	// baseBackendConcurrency is what every compile gets, cmd/go's minTokens.
+	baseBackendConcurrency = 4
+	// A package with at least largePackageBytes of Go source gets up to
+	// maxBackendConcurrency.
+	largePackageBytes     = 1 << 20
+	maxBackendConcurrency = 16
+)
+
+// gcBackendConcurrency returns the -c flag value for compiling opts.Files.
+//
+// cmd/go (compilerConcurrency in $GOROOT/src/cmd/go/internal/work/gc.go)
+// gives every compile min(4, GOMAXPROCS) backend workers and lets it borrow
+// more, up to GOMAXPROCS, from a pool that all compiles of one `go build`
+// share. Package derivations have no pool to share and Nix runs max-jobs of
+// them at once, so more than 4 goes only to a package with at least
+// largePackageBytes of Go source, and both figures are capped by BuildCores.
+//
+// GO19CONCURRENTCOMPILATION=0 turns concurrent compilation off; cmd/go 1.26
+// does not read that variable.
+func gcBackendConcurrency(opts Options) int {
 	switch os.Getenv("GO19CONCURRENTCOMPILATION") {
 	case "0":
 		return 1
@@ -210,11 +241,30 @@ func gcBackendConcurrency() int {
 	default:
 		return 1
 	}
-	c := runtime.GOMAXPROCS(0)
-	if c > 4 {
-		c = 4
+	return backendConcurrency(BuildCores(), goSourceBytes(opts))
+}
+
+func backendConcurrency(cores int, sourceBytes int64) int {
+	if sourceBytes >= largePackageBytes {
+		return min(cores, maxBackendConcurrency)
 	}
-	return c
+	return min(cores, baseBackendConcurrency)
+}
+
+// goSourceBytes returns the size of the Go files of the package.
+func goSourceBytes(opts Options) int64 {
+	if opts.Files == nil {
+		return 0
+	}
+	var total int64
+	for _, names := range [][]string{opts.Files.GoFiles, opts.Files.CgoFiles} {
+		for _, name := range names {
+			if fi, err := os.Stat(filepath.Join(opts.SrcDir, name)); err == nil {
+				total += fi.Size()
+			}
+		}
+	}
+	return total
 }
 
 func extractPackageName(goFile string) string {
