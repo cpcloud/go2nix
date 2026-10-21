@@ -115,7 +115,12 @@ For a cgo package it reads `CC`, `CXX` and `FC` (default `gcc`, `g++`,
 `gfortran`), `CGO_CPPFLAGS`, `CGO_CFLAGS`, `CGO_CXXFLAGS`, `CGO_FFLAGS` and
 `CGO_LDFLAGS` (see [Package Overrides](package-overrides.md#example-env)) and,
 through `pkg-config`, `PKG_CONFIG_PATH` from its environment, and adds the
-package's own `#cgo` lines to them as `go build` does.
+package's own `#cgo` lines to them as `go build` does. Those lines and what
+`pkg-config` prints are checked against cmd/go's lists of permitted flags;
+`CGO_CFLAGS_ALLOW` and `CGO_CFLAGS_DISALLOW`, and the same for `CPPFLAGS`,
+`CXXFLAGS`, `FFLAGS` and `LDFLAGS`, are read from the environment and adjust
+the lists as they do for `go build`
+(see [Package Overrides](package-overrides.md#example-env)).
 
 ### link-binary
 

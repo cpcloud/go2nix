@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 
 	"github.com/numtide/go2nix/pkg/gofiles"
@@ -53,6 +54,20 @@ func (o *Options) rewriteDir() string {
 		return o.ModulePath + "@" + o.ModuleVersion + strings.TrimPrefix(o.ImportPath, o.ModulePath)
 	}
 	return o.ImportPath
+}
+
+// checkInputFileNames is the check of load.Package
+// (cmd/go/internal/load/pkg.go), for the files the compiler and cgo are
+// given by name: the compiler takes //go:cgo_ldflag from any file named
+// _cgo_*, so such a file is never an input, and neither is one whose name
+// reads as a flag.
+func checkInputFileNames(files gofiles.PkgFiles) error {
+	for _, f := range slices.Concat(files.GoFiles, files.CgoFiles) {
+		if base := filepath.Base(f); !safeArg(base) || strings.HasPrefix(base, "_cgo_") {
+			return fmt.Errorf("invalid input file name %q", f)
+		}
+	}
+	return nil
 }
 
 // CompileGoPackage compiles a single Go package (pure Go, assembly, or cgo).
@@ -105,6 +120,10 @@ func CompileGoPackage(opts Options) error {
 		return fmt.Errorf("compile.Options.Files is required (package %s)", opts.ImportPath)
 	}
 	files := *opts.Files
+
+	if err := checkInputFileNames(files); err != nil {
+		return fmt.Errorf("%s: %w", opts.ImportPath, err)
+	}
 
 	if len(files.GoFiles) == 0 && len(files.CgoFiles) == 0 {
 		return fmt.Errorf("no Go files found in %s (package %s)", opts.SrcDir, opts.ImportPath)

@@ -1,6 +1,7 @@
 package compile
 
 import (
+	"bytes"
 	"fmt"
 	"go/build"
 	"io/fs"
@@ -43,9 +44,17 @@ func compileCgo(opts Options, files gofiles.PkgFiles, embedFlag string) error {
 	}
 	pcCflags, pcLdflags, err := pkgConfigFlags(pkg.CgoPkgConfig)
 	if err != nil {
-		return fmt.Errorf("pkg-config: %w", err)
+		return fmt.Errorf("%s: %w", opts.ImportPath, err)
 	}
-	flags := newCgoFlags(pkg, pcCflags, pcLdflags)
+	flags, err := newCgoFlags(pkg, pcCflags, pcLdflags)
+	if err != nil {
+		return fmt.Errorf("%s: %w", opts.ImportPath, err)
+	}
+	// As in runCgo, CPPFLAGS and pkg-config's flags are not looked at.
+	preferLinkExt := flagsNotCompatibleWithInternalLinking(
+		[]string{"CGO_CFLAGS", "CGO_CXXFLAGS", "CGO_FFLAGS"},
+		[][]string{flags.c, flags.cxx, flags.f},
+	)
 
 	// Support gfortran out of the box for Fortran files, matching cmd/go behavior.
 	if len(files.FFiles) > 0 {
@@ -164,6 +173,16 @@ func compileCgo(opts Options, files gofiles.PkgFiles, embedFlag string) error {
 	if dynFailObj != "" {
 		compiledOFiles = append(compiledOFiles, dynFailObj)
 	}
+	// cmd/link prefers external linking when a package's archive has this
+	// member (cmd/go/internal/work/exec.go processCgoOutputs,
+	// cmd/link/internal/ld/lib.go).
+	if preferLinkExt {
+		tokenFile := filepath.Join(cgowork, "preferlinkext")
+		if err := os.WriteFile(tokenFile, nil, 0o644); err != nil {
+			return err
+		}
+		compiledOFiles = append(compiledOFiles, tokenFile)
+	}
 
 	// Step 4a: if .s (Plan 9 assembly) files exist, generate symabis.
 	hasGoAsm := len(goAsmFiles) > 0
@@ -187,6 +206,10 @@ func compileCgo(opts Options, files gofiles.PkgFiles, embedFlag string) error {
 	dynImport := filepath.Join(cgowork, "_cgo_import_"+uid+".go")
 	if _, err := os.Stat(dynImport); err == nil {
 		cgoGoFiles = append(cgoGoFiles, dynImport)
+	}
+
+	if err := checkCgoLdflagPragmas(cgoGoFiles, flags.ld); err != nil {
+		return fmt.Errorf("%s: %w", opts.ImportPath, err)
 	}
 
 	compileArgs := append(baseCompileArgs(opts), opts.outputFlags()...)
@@ -403,8 +426,25 @@ const defaultCFlags = "-O2 -g"
 // newCgoFlags mirrors Builder.CFlags and the flag handling of runCgo
 // (cmd/go/internal/work/exec.go): the CGO_* environment or its default
 // first, then the package's #cgo directives, then pkg-config, whose
-// --cflags go to CPPFLAGS and whose --libs go to LDFLAGS.
-func newCgoFlags(pkg *build.Package, pcCflags, pcLdflags []string) cgoFlags {
+// --cflags go to CPPFLAGS and whose --libs go to LDFLAGS. As in buildFlags,
+// the package's directives are checked and the environment, which is the
+// builder's own, is not.
+func newCgoFlags(pkg *build.Package, pcCflags, pcLdflags []string) (cgoFlags, error) {
+	for _, d := range []struct {
+		name  string
+		flags []string
+		check func(name, source string, list []string) error
+	}{
+		{"CPPFLAGS", pkg.CgoCPPFLAGS, checkCompilerFlags},
+		{"CFLAGS", pkg.CgoCFLAGS, checkCompilerFlags},
+		{"CXXFLAGS", pkg.CgoCXXFLAGS, checkCompilerFlags},
+		{"FFLAGS", pkg.CgoFFLAGS, checkCompilerFlags},
+		{"LDFLAGS", pkg.CgoLDFLAGS, checkLinkerFlags},
+	} {
+		if err := d.check(d.name, "#cgo "+d.name, d.flags); err != nil {
+			return cgoFlags{}, err
+		}
+	}
 	env := func(name, def string) []string {
 		v := os.Getenv("CGO_" + name)
 		if v == "" {
@@ -418,7 +458,21 @@ func newCgoFlags(pkg *build.Package, pcCflags, pcLdflags []string) cgoFlags {
 		cxx: slices.Concat(env("CXXFLAGS", defaultCFlags), pkg.CgoCXXFLAGS),
 		f:   slices.Concat(env("FFLAGS", defaultCFlags), pkg.CgoFFLAGS),
 		ld:  slices.Concat(env("LDFLAGS", defaultCFlags), pkg.CgoLDFLAGS, pcLdflags),
+	}, nil
+}
+
+// flagsNotCompatibleWithInternalLinking is cmd/go's
+// (cmd/go/internal/work/exec.go): it reports whether one of the lists has a
+// flag outside the built-in lists, or -flto.
+func flagsNotCompatibleWithInternalLinking(sourceList []string, flagListList [][]string) bool {
+	for i := range sourceList {
+		sn := sourceList[i]
+		fll := flagListList[i]
+		if err := checkCompilerFlagsForInternalLink(sn, sn, fll); err != nil {
+			return true
+		}
 	}
+	return false
 }
 
 // cgoDirectives returns the #cgo directives of cgoFiles (the Cgo* fields of
@@ -451,28 +505,131 @@ func cgoDirectives(opts Options, cgoFiles []string) (*build.Package, error) {
 
 // pkgConfigFlags runs pkg-config on the arguments of the package's
 // #cgo pkg-config: directives and returns the resulting CFLAGS and LDFLAGS.
-func pkgConfigFlags(pkgNames []string) (cflags, ldflags []string, err error) {
-	if len(pkgNames) == 0 {
+// It mirrors getPkgConfigFlags (cmd/go/internal/work/exec.go): options go
+// ahead of a "--" and names after it, both are checked before pkg-config
+// runs, and so is what it prints.
+func pkgConfigFlags(pcargs []string) (cflags, ldflags []string, err error) {
+	if len(pcargs) == 0 {
 		return nil, nil, nil
 	}
 
-	slog.Debug("pkg-config", "packages", pkgNames)
-
-	// Run pkg-config --cflags.
-	cflagsOut, err := exec.Command("pkg-config", append([]string{"--cflags"}, pkgNames...)...).Output()
-	if err != nil {
-		return nil, nil, fmt.Errorf("pkg-config --cflags %v: %w", pkgNames, err)
+	var pcflags, pkgs []string
+	for _, pcarg := range pcargs {
+		switch {
+		case pcarg == "--":
+			// We're going to add our own "--" argument.
+		case strings.HasPrefix(pcarg, "--"):
+			pcflags = append(pcflags, pcarg)
+		default:
+			pkgs = append(pkgs, pcarg)
+		}
 	}
-	cflags = strings.Fields(strings.TrimSpace(string(cflagsOut)))
-
-	// Run pkg-config --libs.
-	ldflagsOut, err := exec.Command("pkg-config", append([]string{"--libs"}, pkgNames...)...).Output()
-	if err != nil {
-		return nil, nil, fmt.Errorf("pkg-config --libs %v: %w", pkgNames, err)
+	for _, pkg := range pkgs {
+		if !safeArg(pkg) {
+			return nil, nil, fmt.Errorf("invalid pkg-config package name: %s", pkg)
+		}
 	}
-	ldflags = strings.Fields(strings.TrimSpace(string(ldflagsOut)))
+	if err := checkPkgConfigFlags("", "pkg-config", pcflags); err != nil {
+		return nil, nil, err
+	}
 
+	slog.Debug("pkg-config", "options", pcflags, "packages", pkgs)
+
+	run := func(mode string) ([]string, error) {
+		args := slices.Concat([]string{mode}, pcflags, []string{"--"}, pkgs)
+		out, err := exec.Command("pkg-config", args...).Output()
+		if err != nil {
+			return nil, fmt.Errorf("pkg-config %s: %w", strings.Join(args, " "), err)
+		}
+		return strings.Fields(string(out)), nil
+	}
+	if cflags, err = run("--cflags"); err != nil {
+		return nil, nil, err
+	}
+	if err := checkCompilerFlags("CFLAGS", "pkg-config --cflags", cflags); err != nil {
+		return nil, nil, err
+	}
+	if ldflags, err = run("--libs"); err != nil {
+		return nil, nil, err
+	}
+	if err := checkLinkerFlags("LDFLAGS", "pkg-config --libs", ldflags); err != nil {
+		return nil, nil, err
+	}
 	return cflags, ldflags, nil
+}
+
+// checkCgoLdflagPragmas is the end of processCgoOutputs
+// (cmd/go/internal/work/exec.go): the compiler accepts //go:cgo_ldflag in
+// files whose base name starts with "_cgo_", so those among goFiles are
+// read again and every such flag other than the ones passed to cgo is
+// checked. It is a backstop against a comment smuggled into a file cgo
+// generated.
+func checkCgoLdflagPragmas(goFiles, passed []string) error {
+	var flags []string
+	for _, f := range goFiles {
+		if !strings.HasPrefix(filepath.Base(f), "_cgo_") {
+			continue
+		}
+
+		src, err := os.ReadFile(f)
+		if err != nil {
+			return err
+		}
+
+		const cgoLdflag = "//go:cgo_ldflag"
+		idx := bytes.Index(src, []byte(cgoLdflag))
+		for idx >= 0 {
+			// We are looking at //go:cgo_ldflag.
+			// Find start of line.
+			start := bytes.LastIndex(src[:idx], []byte("\n"))
+			if start == -1 {
+				start = 0
+			}
+
+			// Find end of line.
+			end := bytes.Index(src[idx:], []byte("\n"))
+			if end == -1 {
+				end = len(src)
+			} else {
+				end += idx
+			}
+
+			// Check for first line comment in line.
+			// We don't worry about /* */ comments,
+			// which normally won't appear in files
+			// generated by cgo.
+			commentStart := bytes.Index(src[start:], []byte("//"))
+			commentStart += start
+			// If that line comment is //go:cgo_ldflag,
+			// it's a match.
+			if bytes.HasPrefix(src[commentStart:], []byte(cgoLdflag)) {
+				// Pull out the flag, and unquote it.
+				// This is what the compiler does.
+				flag := string(src[idx+len(cgoLdflag) : end])
+				flag = strings.TrimSpace(flag)
+				flag = strings.Trim(flag, `"`)
+				flags = append(flags, flag)
+			}
+			src = src[end:]
+			idx = bytes.Index(src, []byte(cgoLdflag))
+		}
+	}
+
+	// We expect to find the flags passed to cgo in flags.
+	if len(passed) > 0 {
+	outer:
+		for i := range flags {
+			for j, f := range passed {
+				if i+j >= len(flags) || f != flags[i+j] {
+					continue outer
+				}
+			}
+			flags = append(flags[:i], flags[i+len(passed):]...)
+			break
+		}
+	}
+
+	return checkLinkerFlags("LDFLAGS", "go:cgo_ldflag", flags)
 }
 
 // runInEnv is runIn with env added to the inherited environment.

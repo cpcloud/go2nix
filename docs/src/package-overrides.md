@@ -134,20 +134,56 @@ sources need no override; their conditions (`#cgo linux`, a build tag) and
 experimental builder passes no tags to the compile step, and a local package's
 source holds its own directory only, so `-I${SRCDIR}/../include` finds nothing.
 
-`go build` refuses `#cgo` flags and `pkg-config` output that could make the
-compiler or the linker load or run something (`-fplugin=`, `-specs=`, `-B`,
-`-wrapper`, `-fuse-ld=`, `-Wa,…`, `-Xlinker`, `-Wl,--plugin`, `@file`, …)
-unless `CGO_CFLAGS_ALLOW`, `CGO_LDFLAGS_ALLOW` and friends permit them.
-`compile-package` passes on every flag go/build accepts, including those in a
-dependency's sources, and does not read the `CGO_*_ALLOW` and `CGO_*_DISALLOW`
-variables. What confines such a flag is the Nix sandbox: the build user,
-without network, writing the package's own output. With `sandbox = false`
-(the default on macOS) or `relaxed` it runs with the build user's access to
-the machine.
+`compile-package` refuses the `#cgo` flags and the `pkg-config` output that
+`go build` refuses. It carries cmd/go's lists (`cmd/go/internal/work/security.go`
+of Go 1.26), so a flag that could make the compiler or the linker load or run
+something (`-fplugin=`, `-specs=`, `-B`, `-wrapper`, `-fuse-ld=`, `-Wa,…`,
+`-Xlinker`, `-Wl,--plugin`, `@file`, …), and any other flag the lists do not
+have, fails that package with cmd/go's message, for example
+`invalid flag in #cgo CFLAGS: -fplugin=/x.so` or
+`invalid flag in pkg-config --cflags: …`. The names and options on a
+`#cgo pkg-config:` line are checked as well. The `CGO_*` variables above are
+not: they are yours, not the package author's.
+
+As under `go build`, `CGO_CFLAGS_ALLOW`, `CGO_CPPFLAGS_ALLOW`,
+`CGO_CXXFLAGS_ALLOW`, `CGO_FFLAGS_ALLOW` and `CGO_LDFLAGS_ALLOW` each hold a
+regular expression, and a flag of that kind which it matches in full is
+permitted; the `…_DISALLOW` variables refuse what they match and win over
+`…_ALLOW`. `pkg-config --cflags` count as `CFLAGS` and `--libs` as `LDFLAGS`.
+To permit a flag for one package:
+
+```nix
+packageOverrides = {
+  "github.com/example/pkg" = {
+    env = {
+      CGO_CFLAGS_ALLOW = "-mfma";
+    };
+  };
+};
+```
+
+A local package that has `_test.go` files of its own is compiled a second
+time by the test runner, in the application's derivation, which does not see
+`packageOverrides.<pkg>.env`. Under `doCheck` give that derivation the
+variable too (`env.CGO_CFLAGS_ALLOW = "-mfma";` next to `packageOverrides`),
+or set it once for the whole scope in `goEnv`.
+
+One case is particular to Nix: the lists accept no `-` in the value of a
+`-D`, and every store path has one, so a `.pc` file with
+`Cflags: -DDATADIR=${prefix}/share`, or a `#cgo CFLAGS: -DDATADIR=${SRCDIR}/data`
+(`${SRCDIR}` is a store path here), needs `CGO_CFLAGS_ALLOW = "-DDATADIR=.*"`,
+with `go build` just as here.
+
+The Nix sandbox remains the second line of defence. What a permitted flag
+runs, it runs as the build user, without network, writing the package's own
+output; with `sandbox = false` (the default on macOS) or `relaxed`, with the
+build user's access to the machine.
 
 `env` is default-mode only. The experimental builder synthesizes
 derivations at build time inside `go2nix resolve` and can only forward
 store paths, so it rejects `env` (and any other unknown key) at eval time.
+It checks flags in the same way, and has no place to set the `…_ALLOW`
+variables: a package with a flag outside the lists does not build there.
 
 ## Example: `srcOverlay` for build-time-generated `//go:embed` content
 

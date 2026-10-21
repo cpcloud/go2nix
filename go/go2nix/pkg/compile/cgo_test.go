@@ -439,7 +439,10 @@ import "C"
 			for _, k := range []string{"CGO_CPPFLAGS", "CGO_CFLAGS", "CGO_CXXFLAGS", "CGO_FFLAGS", "CGO_LDFLAGS"} {
 				t.Setenv(k, tt.env[k])
 			}
-			got := newCgoFlags(pkg, pcCflags, pcLdflags)
+			got, err := newCgoFlags(pkg, pcCflags, pcLdflags)
+			if err != nil {
+				t.Fatal(err)
+			}
 			if !reflect.DeepEqual(got, tt.want) {
 				t.Errorf("newCgoFlags:\n got %+v\nwant %+v", got, tt.want)
 			}
@@ -458,7 +461,7 @@ func TestPkgConfigFlagsCustomTag(t *testing.T) {
 
 	// Stub pkg-config so the test doesn't depend on the real binary or libfoo.
 	binDir := t.TempDir()
-	stub := "#!/bin/sh\n[ \"$2\" = libfoo ] || exit 1\ncase \"$1\" in --cflags) echo -I/stub;; --libs) echo -lstub;; esac\n"
+	stub := "#!/bin/sh\n[ \"$2\" = -- ] && [ \"$3\" = libfoo ] || exit 1\ncase \"$1\" in --cflags) echo -I/stub;; --libs) echo -lstub;; esac\n"
 	if err := os.WriteFile(filepath.Join(binDir, "pkg-config"), []byte(stub), 0o755); err != nil {
 		t.Fatal(err)
 	}
