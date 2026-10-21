@@ -157,6 +157,14 @@ patterns again over the overlaid source, so an overlay that lacks the files
 still fails the build. In any other package the error stays fatal at eval
 time.
 
+Once one pattern fails, `go list` reports none of the package's embedded
+files, not even checked-in matches of its other patterns. The plugin then
+adds every file under each pattern's leading glob-free directories to the
+application's link and test source, or the whole package directory when the
+first path element has a glob. A change to any of those files re-links the
+application and, under `doCheck`, re-runs its tests, even when no pattern
+matches the file.
+
 The `doCheck` testrunner applies the same overlay before resolving
 `//go:embed` patterns and recompiling for tests, so tests see the
 overlaid content too.
