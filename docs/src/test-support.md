@@ -37,19 +37,28 @@ are not tested.
 Each testable package goes through these steps:
 
 1. **Internal test compilation** — library source files + `_test.go` files
-   in the same package are compiled together into a single archive that
-   replaces the library archive.
-1. **Dependent recompilation** — local packages that transitively depend on
-   the package under test are recompiled against the test archive so the
-   dependency graph stays consistent (otherwise the xtest would link two
-   copies of the package — one with test helpers, one without).
+   in the same package are compiled together, in the package's directory,
+   into a single archive that replaces the library archive.
+1. **Dependent recompilation** — when the package has internal tests, local
+   packages that transitively depend on it are recompiled against the test
+   archive so the dependency graph stays consistent (otherwise the xtest
+   would link two copies of the package — one with test helpers, one
+   without). A package with external tests only keeps its archive, and so
+   do its dependents.
 1. **External test compilation** — `_test.go` files in the `*_test` package
    (xtests) are compiled as a separate package that imports the internal
    test archive.
 1. **Test main generation** — a `_testmain.go` is generated that registers
    all `Test*`, `Benchmark*`, `Fuzz*`, and `Example*` functions.
-1. **Link and run** — the test binary is linked and executed in the package's
-   source directory.
+1. **Link and run** — the test binary is linked, with `$CXX` as the external
+   linker when a package of the build (test-only dependencies included) has
+   C++ sources and `$CC` otherwise, and executed in the package's source
+   directory.
+
+All of these compiles get the `-lang` of the `go` line of the module the
+package belongs to (a sibling module's own, behind a filesystem `replace`),
+like the package's own derivation: a module that says `go 1.21` is tested
+with the loop-variable semantics it ships with.
 
 ### Internal tests vs external tests (xtests)
 
@@ -89,12 +98,12 @@ that derivation: it relinks and re-runs the tests.
 
 Embed directives in test files are supported:
 
-- `TestEmbedPatterns` (from internal `_test.go` files) are resolved and
-  their files are symlinked into the internal test source directory alongside
-  the package's regular embed files. The embed configs are merged.
+- `TestEmbedPatterns` (from internal `_test.go` files) are resolved against
+  the package's directory and merged with the package's regular embed
+  config for the internal test archive.
 
-- `XTestEmbedPatterns` (from external `_test.go` files) are resolved and
-  symlinked into the xtest source directory with their own embed config.
+- `XTestEmbedPatterns` (from external `_test.go` files) are resolved the
+  same way into the external test package's own embed config.
 
 ## `extraMainSrcFiles`
 
@@ -126,6 +135,12 @@ Each entry is relative to `src` (not `modRoot`). A directory entry includes
 its full subtree, and a trailing `/` is tolerated. An entry that does not
 exist under `src` fails evaluation.
 
+The same goes for a C header that a cgo file of a package with internal
+tests, or of a dependent recompiled for them, includes from a sub-directory
+(`#include "include/x.h"`): the package is compiled again for the tests
+from this copy, and `go list` reports only the headers next to the Go
+files. List the sub-directory.
+
 ## `checkFlags`
 
 Extra flags passed to the test binary (not to `go test`, since go2nix
@@ -146,6 +161,11 @@ The flags are handed to the test binary as they are, so they take the
 `-test.bench`, `-test.timeout`. The short forms (`-v`, `-run`) are `go test`
 rewrites and the binary rejects them.
 
+Ahead of them the binary always gets `-test.paniconexit0`, as it does from
+`go test`: a test, or code it calls, that reaches `os.Exit(0)` fails the
+package with `unexpected call to os.Exit(0) during test` instead of ending
+the run early with the exit status of a pass.
+
 ## Limitations
 
 - **Default mode only.** The experimental builder does not run tests.
@@ -157,7 +177,15 @@ rewrites and the binary rejects them.
 - **The working directory is read-only.** Each test runs in its package's
   directory inside the filtered source copy, which is a store path: a test
   that writes next to its sources fails. Use `t.TempDir()`.
+- **Headers in a sub-directory of a cgo package** are not in the filtered
+  source copy; a package that is compiled again for tests needs them listed
+  in [`extraMainSrcFiles`](#extramainsrcfiles).
 - **No `go test` extras.** No coverage instrumentation, no `vet` pass, no
   default 10-minute timeout, and packages are tested one after another.
-- **`ldflags` do not reach test binaries**; they are linked with the
-  importcfg only.
+- **`ldflags` do not reach test binaries.** On its own the test link adds
+  what `go test` adds: `-X testing.testBinary=1`, which makes
+  `testing.Testing()` true, and the default `GODEBUG` the application gets
+  from the main module's `go.mod`, extended with the `//go:debug` lines of
+  the package, of its `_test.go` files and of its external test package.
+- **No build info in test binaries.** `debug.ReadBuildInfo()` reports
+  `ok == false` inside a test.

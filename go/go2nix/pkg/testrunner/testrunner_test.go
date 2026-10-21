@@ -4,6 +4,8 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"slices"
+	"strings"
 	"testing"
 
 	"github.com/numtide/go2nix/pkg/gofiles"
@@ -68,6 +70,50 @@ func TestOverrideImportCfgEntry(t *testing.T) {
 	}
 }
 
+func TestTestLinkFlags(t *testing.T) {
+	root := t.TempDir()
+	for name, src := range map[string]string{
+		"old/go.mod":      "module example.com/old\n\ngo 1.21\n",
+		"old/p/p.go":      "package p\n",
+		"old/p/p_test.go": "//go:debug panicnil=1\npackage p\n",
+		"new/go.mod":      "module example.com/new\n\ngo 1.99\n",
+		"new/p/p.go":      "package p\n",
+	} {
+		path := filepath.Join(root, name)
+		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, []byte(src), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	t.Setenv("GOFIPS140", "")
+
+	// go 1.21: httpmuxgo121=1 is a default with every toolchain from 1.22 on;
+	// panicnil=1 comes from the _test.go file only.
+	got := testLinkFlags(Options{ModuleRoot: filepath.Join(root, "old")},
+		&localpkgs.LocalPkg{SrcDir: filepath.Join(root, "old/p")})
+	if len(got) != 3 || got[0] != "-X" || got[1] != "testing.testBinary=1" {
+		t.Fatalf("testLinkFlags = %v, want -X testing.testBinary=1 and one more flag", got)
+	}
+	godebug, ok := strings.CutPrefix(got[2], "-X=runtime.godebugDefault=")
+	if !ok {
+		t.Fatalf("testLinkFlags[2] = %q, want -X=runtime.godebugDefault=...", got[2])
+	}
+	for _, want := range []string{"httpmuxgo121=1", "panicnil=1"} {
+		if !slices.Contains(strings.Split(godebug, ","), want) {
+			t.Errorf("default GODEBUG %q lacks %s", godebug, want)
+		}
+	}
+
+	// Nothing to default for a module newer than every table entry.
+	got = testLinkFlags(Options{ModuleRoot: filepath.Join(root, "new")},
+		&localpkgs.LocalPkg{SrcDir: filepath.Join(root, "new/p")})
+	if want := []string{"-X", "testing.testBinary=1"}; !reflect.DeepEqual(got, want) {
+		t.Errorf("testLinkFlags = %v, want %v", got, want)
+	}
+}
+
 func TestInternalTestPkgFiles(t *testing.T) {
 	// Regression for finding #3: the internal-test compile must carry the
 	// package's CgoFiles/SFiles/SysoFiles/etc. through so CompileGoPackage
@@ -111,6 +157,39 @@ func TestInternalTestPkgFiles(t *testing.T) {
 	}
 	if !reflect.DeepEqual(got.SysoFiles, []string{"blob.syso"}) {
 		t.Errorf("SysoFiles = %v, want [blob.syso]", got.SysoFiles)
+	}
+}
+
+func TestLangVersions(t *testing.T) {
+	root := t.TempDir()
+	write := func(rel, content string) {
+		t.Helper()
+		path := filepath.Join(root, rel)
+		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	write("app/go.mod", "module example.com/app\n\ngo 1.21\n")
+	write("app/internal/a/a.go", "package a\n")
+	write("app/internal/skipped/s.go", "package skipped\n")
+	write("sib/go.mod", "module example.com/sib\n\ngo 1.20.3\n")
+	write("sib/util/u.go", "package util\n")
+
+	pkgs := []*localpkgs.LocalPkg{
+		{ImportPath: "example.com/app/internal/a", SrcDir: filepath.Join(root, "app/internal/a")},
+		{ImportPath: "example.com/app/internal/skipped", SrcDir: filepath.Join(root, "app/internal/skipped")},
+		{ImportPath: "example.com/sib/util", SrcDir: filepath.Join(root, "sib/util")},
+	}
+	got := langVersions(pkgs, func(ip string) bool { return ip != "example.com/app/internal/skipped" })
+	want := map[string]string{
+		"example.com/app/internal/a": "1.21",
+		"example.com/sib/util":       "1.20",
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("langVersions = %v, want %v", got, want)
 	}
 }
 
@@ -169,6 +248,17 @@ func TestApplySrcOverlay(t *testing.T) {
 	}
 }
 
+func TestExternalLinker(t *testing.T) {
+	t.Setenv("CC", "the-cc")
+	t.Setenv("CXX", "the-cxx")
+	if got := externalLinker(false); got != "the-cc" {
+		t.Errorf("externalLinker(false) = %q, want $CC", got)
+	}
+	if got := externalLinker(true); got != "the-cxx" {
+		t.Errorf("externalLinker(true) = %q, want $CXX", got)
+	}
+}
+
 func TestSanitize(t *testing.T) {
 	tests := []struct {
 		input, want string
@@ -181,5 +271,20 @@ func TestSanitize(t *testing.T) {
 		if got := sanitize(tt.input); got != tt.want {
 			t.Errorf("sanitize(%q) = %q, want %q", tt.input, got, tt.want)
 		}
+	}
+}
+
+func TestTestBinaryArgs(t *testing.T) {
+	if got, want := testBinaryArgs(nil), []string{"-test.paniconexit0"}; !reflect.DeepEqual(got, want) {
+		t.Errorf("testBinaryArgs(nil) = %v, want %v", got, want)
+	}
+	checkFlags := []string{"-test.v", "-test.run", "X"}
+	got := testBinaryArgs(checkFlags)
+	want := []string{"-test.paniconexit0", "-test.v", "-test.run", "X"}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("testBinaryArgs = %v, want %v", got, want)
+	}
+	if !reflect.DeepEqual(checkFlags, []string{"-test.v", "-test.run", "X"}) {
+		t.Errorf("checkFlags modified: %v", checkFlags)
 	}
 }

@@ -203,6 +203,10 @@ type TestManifest struct {
 	Tags        []string          `json:"tags"`
 	GCFlags     []string          `json:"gcflags"`
 	CheckFlags  []string          `json:"checkFlags"`
+	// CXX reports whether any package the test binaries can link has C++
+	// sources (CXXFiles or SwigCXXFiles), so test-packages picks the C++
+	// compiler for -extld as link-binary does for LinkSubPackage.CXX.
+	CXX bool `json:"cxx,omitempty"`
 }
 
 // LoadTestManifest reads and validates a test manifest from path.

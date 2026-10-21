@@ -1054,6 +1054,17 @@ let
   # Selects testDepsImportcfg when test-only deps exist, depsImportcfg otherwise.
   hasTestDeps = doCheck && goPackagesResult ? testPackages && goPackagesResult.testPackages != { };
 
+  # cmd/go links a test binary with CXX instead of CC when a package in it
+  # has C++ sources (cmd/go/internal/work/gc.go:591-595). One bit serves
+  # every test binary of the build: CXX links the ones without C++ as well.
+  testCxx =
+    builtins.any (p: (p.files.cxxFiles or [ ]) != [ ] || (p.files.swigCxxFiles or [ ]) != [ ])
+      (
+        builtins.attrValues goPackagesResult.packages
+        ++ builtins.attrValues (goPackagesResult.testPackages or { })
+        ++ builtins.attrValues allLocalPkgInfo
+      );
+
   # Shared by link and test manifests; hoisted so the mapAttrs runs once.
   localArchives = builtins.mapAttrs (importPath: pkg: "${pkg}/${importPath}.a") localPackages;
   localIfaces = builtins.mapAttrs (importPath: pkg: "${pkg.iface}/${importPath}.x") localPackages;
@@ -1164,6 +1175,7 @@ let
         inherit localIfaces;
       }
       // optionalAttrs (localSrcOverlays != { }) { srcOverlays = localSrcOverlays; }
+      // optionalAttrs testCxx { cxx = true; }
       // {
         inherit moduleRoot;
         inherit tags;

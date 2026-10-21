@@ -63,6 +63,10 @@ the result or on an expected failure; they are the packages
 `-nested-module` and `-testmain-badsig`. `large_manifest_test.nix` generates
 its module (220 packages) instead of reading one from `fixtures/`.
 
+`test_exit_zero_test.nix` is one more of that kind, the package
+`test-fixture-test-exit-zero`: it expects the test run to fail, and the
+fixture asserts that in its own check phase.
+
 ## `test-ca.sh`
 
 Starts a throw-away Nix daemon with `ca-derivations` enabled, builds the

@@ -122,8 +122,7 @@ func BuildPkgFiles(pkg *build.Package, dir string) (PkgFiles, error) {
 		}
 		result.EmbedCfg = cfg
 		// EmbedFiles must contain resolved file paths (from EmbedCfg.Files),
-		// not raw patterns. The test runner symlinks these into synthetic
-		// source directories, so they must be actual relative paths.
+		// not raw patterns.
 		embedFiles := make([]string, 0, len(cfg.Files))
 		for f := range cfg.Files {
 			embedFiles = append(embedFiles, f)

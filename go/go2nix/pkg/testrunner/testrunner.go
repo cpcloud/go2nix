@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"strings"
 
+	"github.com/numtide/go2nix/pkg/buildinfo"
 	"github.com/numtide/go2nix/pkg/compile"
 	"github.com/numtide/go2nix/pkg/gofiles"
 	"github.com/numtide/go2nix/pkg/localpkgs"
@@ -27,7 +28,6 @@ type Options struct {
 	// local packages so test compiles cut off when no exported API
 	// changes). Empty means compile and link share ImportCfg.
 	CompileImportCfg string
-	LocalDir         string   // directory with compiled local .a files
 	TrimPath         string   // path prefix to trim
 	Tags             string   // comma-separated build tags
 	GCFlagsList      []string // extra compiler flags
@@ -48,6 +48,9 @@ type Options struct {
 	// overlay any in-closure srcOverlay package fails embed resolution
 	// (or, with placeholders present, observes source-tree content).
 	SrcOverlays map[string]string
+	// CXX selects $CXX instead of $CC as the external linker of the test
+	// binaries (TestManifest.CXX).
+	CXX bool
 }
 
 func (o Options) checkFlagsArgs() []string {
@@ -109,6 +112,9 @@ func Run(opts Options) error {
 	}
 	slog.Info("testable packages", "count", len(testable), "skipped", skipped)
 
+	// Before the overlays: one moves SrcDir to a copy outside the module.
+	goVersions := langVersions(pkgs, inScope)
+
 	// Resolve //go:embed patterns now, only for packages in scope. Doing this
 	// after the LocalArchives filter means an out-of-scope package whose
 	// embed targets are absent from mainSrc (e.g. supplied at build time
@@ -131,11 +137,25 @@ func Run(opts Options) error {
 	}
 
 	for _, p := range testable {
-		if err := runPackageTests(opts, modulePath, p, pkgMap); err != nil {
+		if err := runPackageTests(opts, modulePath, p, pkgMap, goVersions); err != nil {
 			return fmt.Errorf("testing %s: %w", p.ImportPath, err)
 		}
 	}
 	return nil
+}
+
+// langVersions returns, per in-scope import path, the go line of the go.mod
+// above the package's directory, which is the package's own module also for
+// a sibling behind a filesystem replace: mainSrc carries go.mod at modRoot
+// and at every replace target.
+func langVersions(pkgs []*localpkgs.LocalPkg, inScope func(string) bool) map[string]string {
+	versions := make(map[string]string)
+	for _, p := range pkgs {
+		if inScope(p.ImportPath) {
+			versions[p.ImportPath] = compile.FindGoVersion(p.SrcDir)
+		}
+	}
+	return versions
 }
 
 // applySrcOverlay layers the packageOverrides.<pkg>.srcOverlay derivation
@@ -237,7 +257,13 @@ func affectedLocalDeps(targetPkg string, xtestLocalImports []string, pkgMap map[
 	})
 }
 
-func runPackageTests(opts Options, modulePath string, pkg *localpkgs.LocalPkg, pkgMap map[string]*localpkgs.LocalPkg) error {
+// runPackageTests builds and runs the test binary of pkg. goVersions holds,
+// per import path, the go line of the go.mod above the package: cmd/go
+// compiles ptest, pxtest and pmain with the -lang of the module of the
+// package under test, and a recompiled dependent with its own
+// (cmd/go/internal/work/gc.go:68-80; load.TestPackagesAndErrors keeps
+// Module: p.Module).
+func runPackageTests(opts Options, modulePath string, pkg *localpkgs.LocalPkg, pkgMap map[string]*localpkgs.LocalPkg, goVersions map[string]string) error {
 	slog.Info("testing", "pkg", pkg.ImportPath)
 
 	testDir := filepath.Join(opts.TrimPath, "test-"+sanitize(pkg.ImportPath))
@@ -277,42 +303,10 @@ func runPackageTests(opts Options, modulePath string, pkg *localpkgs.LocalPkg, p
 
 	// Step 1: Compile internal test archive (replaces library archive)
 	// This includes the library's GoFiles + internal _test.go files,
-	// compiled with the same import path as the original package.
-	internalArchive := filepath.Join(testDir, "internal.a")
+	// compiled with the same import path as the original package, in the
+	// package's own directory: a cgo file may include a header from a
+	// sub-directory, and the embed configs name files below SrcDir.
 	if len(pkg.TestGoFiles) > 0 {
-		// Create a merged source directory with library + test files
-		mergedDir := filepath.Join(testDir, "src-internal")
-		if err := os.MkdirAll(mergedDir, 0o755); err != nil {
-			return err
-		}
-		// Symlink all source files from the package directory
-		allFiles := append(append([]string{}, pkg.GoFiles...), pkg.CgoFiles...)
-		allFiles = append(allFiles, pkg.SFiles...)
-		allFiles = append(allFiles, pkg.CFiles...)
-		allFiles = append(allFiles, pkg.CXXFiles...)
-		allFiles = append(allFiles, pkg.HFiles...)
-		allFiles = append(allFiles, pkg.FFiles...)
-		allFiles = append(allFiles, pkg.SysoFiles...)
-		allFiles = append(allFiles, pkg.TestGoFiles...)
-		for _, f := range allFiles {
-			src := filepath.Join(pkg.SrcDir, f)
-			dst := filepath.Join(mergedDir, f)
-			if err := os.Symlink(src, dst); err != nil && !os.IsExist(err) {
-				return fmt.Errorf("symlinking %s: %w", f, err)
-			}
-		}
-		// Symlink production embed files and test-only embed files.
-		for _, f := range append(pkg.EmbedFiles, pkg.TestEmbedFiles...) {
-			src := filepath.Join(pkg.SrcDir, f)
-			dst := filepath.Join(mergedDir, f)
-			if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
-				return fmt.Errorf("creating embed dir for %s: %w", f, err)
-			}
-			if err := os.Symlink(src, dst); err != nil && !os.IsExist(err) {
-				return fmt.Errorf("symlinking embed %s: %w", f, err)
-			}
-		}
-
 		// Merge production + test embed configs for the compiler.
 		mergedEmbedCfg, err := gofiles.MergeEmbedCfg(pkg.EmbedCfg, pkg.TestEmbedCfg)
 		if err != nil {
@@ -325,11 +319,13 @@ func runPackageTests(opts Options, modulePath string, pkg *localpkgs.LocalPkg, p
 		// syso file sets so compile.CompileGoPackage takes the cgo or
 		// asm path instead of the pure-Go -complete path.
 		internalFiles := internalTestPkgFiles(pkg, mergedEmbedCfg)
+		internalArchive := filepath.Join(testDir, "internal.a")
 		if err := compile.CompileGoPackage(compile.Options{
 			ImportPath:  pkg.ImportPath,
-			SrcDir:      mergedDir,
+			SrcDir:      pkg.SrcDir,
 			Output:      internalArchive,
 			ImportCfg:   testCompileImportCfg,
+			GoVersion:   goVersions[pkg.ImportPath],
 			TrimPath:    opts.TrimPath,
 			GCFlagsList: opts.GCFlagsList,
 			Tags:        opts.tagsList(),
@@ -337,19 +333,10 @@ func runPackageTests(opts Options, modulePath string, pkg *localpkgs.LocalPkg, p
 		}); err != nil {
 			return fmt.Errorf("compiling internal test: %w", err)
 		}
-	} else {
-		// No internal tests — use the library archive as-is
-		libArchive := filepath.Join(opts.LocalDir, pkg.ImportPath+".a")
-		if err := copyFile(libArchive, internalArchive); err != nil {
-			// Library might be a command package (no .a), skip
-			internalArchive = ""
-		}
-	}
 
-	// Override the package entry in importcfg to point to the test archive.
-	// We rewrite the importcfg filtering out any existing entry for this
-	// package to avoid duplicate packagefile directives.
-	if internalArchive != "" {
+		// Override the package entry in importcfg to point to the test archive.
+		// We rewrite the importcfg filtering out any existing entry for this
+		// package to avoid duplicate packagefile directives.
 		if err := overrideBoth(pkg.ImportPath, internalArchive); err != nil {
 			return fmt.Errorf("overriding importcfg for %s: %w", pkg.ImportPath, err)
 		}
@@ -358,8 +345,12 @@ func runPackageTests(opts Options, modulePath string, pkg *localpkgs.LocalPkg, p
 	// Step 1b: Recompile local packages that transitively depend on the
 	// package under test ("recompileForTest"). After replacing the package
 	// archive with the internal test version, dependents must be recompiled
-	// so xtest compilation and linking see consistent archives.
-	if internalArchive != "" && len(pkg.XTestGoFiles) > 0 {
+	// so xtest compilation and linking see consistent archives. Without
+	// internal tests nothing was replaced: both importcfgs keep the entries
+	// of the package's own derivation, and cmd/go recompiles nothing either
+	// (load.recompileForTest replaces an import only where its test copy
+	// differs from it, and ptest is p then).
+	if len(pkg.TestGoFiles) > 0 && len(pkg.XTestGoFiles) > 0 {
 		// Filter xtest imports to local-only for the forward closure.
 		var xtestLocalImports []string
 		for _, imp := range pkg.XTestImports {
@@ -383,6 +374,7 @@ func runPackageTests(opts Options, modulePath string, pkg *localpkgs.LocalPkg, p
 				SrcDir:      depPkg.SrcDir,
 				Output:      recompArchive,
 				ImportCfg:   testCompileImportCfg,
+				GoVersion:   goVersions[depIP],
 				TrimPath:    opts.TrimPath,
 				GCFlagsList: opts.GCFlagsList,
 				Tags:        opts.tagsList(),
@@ -399,36 +391,14 @@ func runPackageTests(opts Options, modulePath string, pkg *localpkgs.LocalPkg, p
 	// Step 2: Compile external test archive
 	externalArchive := filepath.Join(testDir, "external.a")
 	if len(pkg.XTestGoFiles) > 0 {
-		xtestDir := filepath.Join(testDir, "src-xtest")
-		if err := os.MkdirAll(xtestDir, 0o755); err != nil {
-			return err
-		}
-		for _, f := range pkg.XTestGoFiles {
-			src := filepath.Join(pkg.SrcDir, f)
-			dst := filepath.Join(xtestDir, f)
-			if err := os.Symlink(src, dst); err != nil && !os.IsExist(err) {
-				return fmt.Errorf("symlinking %s: %w", f, err)
-			}
-		}
-		// Symlink xtest embed files.
-		for _, f := range pkg.XTestEmbedFiles {
-			src := filepath.Join(pkg.SrcDir, f)
-			dst := filepath.Join(xtestDir, f)
-			if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
-				return fmt.Errorf("creating xtest embed dir for %s: %w", f, err)
-			}
-			if err := os.Symlink(src, dst); err != nil && !os.IsExist(err) {
-				return fmt.Errorf("symlinking xtest embed %s: %w", f, err)
-			}
-		}
-
 		// Explicit file list: _test.go files would be classified as
 		// TestGoFiles/XTestGoFiles by ImportDir, not GoFiles.
 		if err := compile.CompileGoPackage(compile.Options{
 			ImportPath:  pkg.ImportPath + "_test",
-			SrcDir:      xtestDir,
+			SrcDir:      pkg.SrcDir,
 			Output:      externalArchive,
 			ImportCfg:   testCompileImportCfg,
+			GoVersion:   goVersions[pkg.ImportPath],
 			TrimPath:    opts.TrimPath,
 			GCFlagsList: opts.GCFlagsList,
 			Tags:        opts.tagsList(),
@@ -475,6 +445,7 @@ func runPackageTests(opts Options, modulePath string, pkg *localpkgs.LocalPkg, p
 		SrcDir:      testDir,
 		Output:      testMainArchive,
 		ImportCfg:   testCompileImportCfg,
+		GoVersion:   goVersions[pkg.ImportPath],
 		TrimPath:    opts.TrimPath,
 		GCFlagsList: opts.GCFlagsList,
 		Tags:        opts.tagsList(),
@@ -485,10 +456,6 @@ func runPackageTests(opts Options, modulePath string, pkg *localpkgs.LocalPkg, p
 
 	// Step 5: Link test binary
 	testBin := filepath.Join(testDir, "test.exe")
-	linkImportCfg := testImportCfg + ".link"
-	if err := copyFile(testImportCfg, linkImportCfg); err != nil {
-		return err
-	}
 
 	// Use `go tool link` rather than invoking the linker binary directly.
 	// The build phase invokes the linker directly to prevent GOROOT embedding
@@ -496,11 +463,13 @@ func runPackageTests(opts Options, modulePath string, pkg *localpkgs.LocalPkg, p
 	// matter. Using `go tool link` matches how compile uses `go tool compile`.
 	linkArgs := []string{
 		"tool", "link",
+		"-extld", externalLinker(opts.CXX),
 		"-buildid=redacted",
-		"-importcfg", linkImportCfg,
+		"-importcfg", testImportCfg,
 		"-o", testBin,
-		testMainArchive,
 	}
+	linkArgs = append(linkArgs, testLinkFlags(opts, pkg)...)
+	linkArgs = append(linkArgs, testMainArchive)
 	cmd := exec.Command("go", linkArgs...)
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
@@ -509,7 +478,7 @@ func runPackageTests(opts Options, modulePath string, pkg *localpkgs.LocalPkg, p
 	}
 
 	// Step 6: Run tests
-	testArgs := opts.checkFlagsArgs()
+	testArgs := testBinaryArgs(opts.checkFlagsArgs())
 	testCmd := exec.Command(testBin, testArgs...)
 	testCmd.Dir = pkg.SrcDir
 	testCmd.Stdout = os.Stdout
@@ -542,6 +511,24 @@ func internalTestPkgFiles(pkg *localpkgs.LocalPkg, embedCfg *gofiles.EmbedCfg) g
 	}
 }
 
+// testLinkFlags returns the flags cmd/go adds to the link of pkg's test
+// binary: -X testing.testBinary=1, which is what testing.Testing reads, and
+// the default GODEBUG (cmd/go/internal/load.TestPackagesAndErrors,
+// work.gcToolchain.ld). The latter comes from the main module's go.mod, like
+// the application's in link-binary and also for a package of a sibling
+// module (defaultGODEBUG reads MainModules), and from the //go:debug lines
+// of the package and of its tests.
+func testLinkFlags(opts Options, pkg *localpkgs.LocalPkg) []string {
+	flags := []string{"-X", "testing.testBinary=1"}
+	bctx := gofiles.BuildContext(opts.Tags, compile.ToolchainVersion())
+	godebugDefault := buildinfo.DefaultGODEBUG(opts.ModuleRoot,
+		buildinfo.ParseTestGodebugs(&bctx, pkg.SrcDir), os.Getenv("GOFIPS140"), compile.ToolchainVersion(), compile.GoEnvVar("GOROOT"))
+	if godebugDefault != "" {
+		flags = append(flags, "-X=runtime.godebugDefault="+godebugDefault)
+	}
+	return flags
+}
+
 // overrideImportCfgEntry rewrites the importcfg file, replacing (or adding)
 // the packagefile entry for importPath with the given archive path.
 // This avoids duplicate packagefile directives which have undefined behavior.
@@ -565,8 +552,30 @@ func overrideImportCfgEntry(importCfgPath, importPath, archivePath string) error
 	return os.WriteFile(importCfgPath, []byte(strings.Join(lines, "\n")+"\n"), 0o644)
 }
 
+// externalLinker is cmd/go's choice of -extld, which it always passes: $CXX
+// when a linked package has C++ sources and $CC otherwise, each with the
+// toolchain's own default when unset (cmd/go/internal/work/gc.go:591-595,
+// 632-644; link-binary chooses the same way from LinkSubPackage.CXX). Left
+// alone, cmd/link runs its platform default ("gcc", "clang" on darwin), which
+// links no C++ runtime and need not be on PATH.
+func externalLinker(cxx bool) string {
+	if cxx {
+		return compile.GoEnvVar("CXX")
+	}
+	return compile.GoEnvVar("CC")
+}
+
 func sanitize(s string) string {
 	return strings.NewReplacer("/", "_", ".", "_").Replace(s)
+}
+
+// testBinaryArgs returns the arguments a test binary is started with. cmd/go
+// puts -test.paniconexit0 ahead of the user's flags
+// (cmd/go/internal/test.runTestActor.Act): package testing then turns an
+// os.Exit(0) reached while tests run into a panic, where the process would
+// otherwise end with the status of a passing run.
+func testBinaryArgs(checkFlags []string) []string {
+	return append([]string{"-test.paniconexit0"}, checkFlags...)
 }
 
 func copyFile(src, dst string) error {

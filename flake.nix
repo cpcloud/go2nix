@@ -97,10 +97,21 @@
               {
                 inherit flake system;
               };
+          test-fixture-xtest-only-ca = callPkgWith ./packages/test-fixture-xtest-only-ca/default.nix {
+            inherit flake system;
+          };
           test-fixture-cgo-internal-test = callPkgWith ./packages/test-fixture-cgo-internal-test/default.nix {
             inherit flake system;
           };
+          test-fixture-cgo-test-subdir-header =
+            callPkgWith ./packages/test-fixture-cgo-test-subdir-header/default.nix
+              {
+                inherit flake system;
+              };
           test-fixture-test-helper-pkg = callPkgWith ./packages/test-fixture-test-helper-pkg/default.nix {
+            inherit flake system;
+          };
+          test-fixture-test-link-flags = callPkgWith ./packages/test-fixture-test-link-flags/default.nix {
             inherit flake system;
           };
           test-fixture-dual-cgo = callPkgWith ./packages/test-fixture-dual-cgo/default.nix {
@@ -128,6 +139,9 @@
             inherit flake system;
           };
           test-fixture-testmain-badsig = callPkgWith ./tests/nix/testmain_badsig_test.nix {
+            inherit flake system;
+          };
+          test-fixture-test-exit-zero = callPkgWith ./tests/nix/test_exit_zero_test.nix {
             inherit flake system;
           };
           test-fixture-mainsrc-replace = callPkgWith ./tests/nix/mainsrc_replace_test.nix {

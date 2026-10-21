@@ -3,6 +3,7 @@ package buildinfo
 import (
 	"os"
 	"path/filepath"
+	"slices"
 	"testing"
 )
 
@@ -402,6 +403,38 @@ package main
 	}
 	if _, ok := gotM["ignored"]; ok {
 		t.Errorf("ParseSourceGodebugs: directive after package clause should not be collected; got %v", got)
+	}
+}
+
+// A test binary takes the directives of the package, of its _test.go files
+// and of its external test package, in that order, so that a later one
+// overrides an earlier one for the same key (cmd/go defaultGODEBUG).
+func TestParseTestGodebugs(t *testing.T) {
+	dir := t.TempDir()
+	for name, src := range map[string]string{
+		"p.go":      "//go:debug panicnil=0\n//go:debug tlssha1=1\npackage p\n",
+		"p_test.go": "//go:debug panicnil=1\npackage p\n",
+		"x_test.go": "//go:debug randautoseed=0\npackage p_test\n",
+	} {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte(src), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	want := []Godebug{{"panicnil", "0"}, {"tlssha1", "1"}, {"panicnil", "1"}, {"randautoseed", "0"}}
+	if got := ParseTestGodebugs(nil, dir); !slices.Equal(got, want) {
+		t.Errorf("ParseTestGodebugs = %v, want %v", got, want)
+	}
+	if got := ParseSourceGodebugs(nil, dir); !slices.Equal(got, want[:2]) {
+		t.Errorf("ParseSourceGodebugs = %v, want %v (test files excluded)", got, want[:2])
+	}
+
+	gomod := "module example.com/test\n\ngo 1.26\n"
+	if err := os.WriteFile(filepath.Join(dir, "go.mod"), []byte(gomod), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if got, want := DefaultGODEBUG(dir, ParseTestGodebugs(nil, dir), "", "go1.26.3", ""), "panicnil=1,randautoseed=0,tlssha1=1"; got != want {
+		t.Errorf("DefaultGODEBUG = %q, want %q", got, want)
 	}
 }
 
