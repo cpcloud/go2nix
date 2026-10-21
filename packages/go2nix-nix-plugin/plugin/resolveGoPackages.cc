@@ -148,6 +148,11 @@ static RegisterPrimOp rp(PrimOp {
   - `resolveHashes` (optional): When true, resolves NAR hashes for all
     modules from go.sum + GOMODCACHE, enabling lockfile-free builds.
     Returns `moduleHashes` in the output (default: false)
+  - `srcOverlays` (optional): Attrset mapping each `packageOverrides` key
+    (an import path or a module path) to whether that entry sets
+    `srcOverlay`. A //go:embed pattern that matches no file is not an
+    error in a package that has an overlay, since the overlay supplies the
+    files at build time (default: {})
 
   Returns: { apiLevel, packages, localPackages, modulePath, goVersion,
     replacements, subPackageClosures, siblingModules, localReplaceDirs,

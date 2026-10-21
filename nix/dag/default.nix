@@ -464,6 +464,17 @@ let
       }
       // (if goProxy != null then { inherit goProxy; } else { })
       // (if CGO_ENABLED != null then { cgoEnabled = toString CGO_ENABLED; } else { })
+      # go list reports a //go:embed pattern whose files a srcOverlay adds at
+      # build time as an error; the plugin tolerates that error only for
+      # packages resolveOverride gives an overlay. Only whether each entry
+      # sets srcOverlay is passed: the overlay derivation itself must not
+      # reach the eval-time go list (that would be IFD).
+      // (
+        if hasPackageOverrides then
+          { srcOverlays = builtins.mapAttrs (_: o: o ? srcOverlay) packageOverrides; }
+        else
+          { }
+      )
     )
   );
 

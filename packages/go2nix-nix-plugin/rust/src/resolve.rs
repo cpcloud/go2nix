@@ -86,6 +86,10 @@ struct GoPackage {
     test_embed_files: Vec<String>,
     #[serde(rename = "XTestEmbedFiles")]
     x_test_embed_files: Vec<String>,
+    #[serde(rename = "TestEmbedPatterns")]
+    test_embed_patterns: Vec<String>,
+    #[serde(rename = "XTestEmbedPatterns")]
+    x_test_embed_patterns: Vec<String>,
     #[serde(rename = "CgoPkgConfig")]
     cgo_pkg_config: Vec<String>,
     #[serde(rename = "CgoCFLAGS")]
@@ -203,6 +207,12 @@ struct LocalPkgData {
     /// (build, test, and xtest). The test-embed entries are merged in from
     /// the `-test` pass since `go list` only resolves them under `-test`.
     main_src_files: Vec<String>,
+    /// Every //go:embed pattern of the package: build, test, and xtest.
+    embed_patterns: Vec<String>,
+    /// go list could not resolve the package's //go:embed patterns because
+    /// its srcOverlay supplies files they need (see [`overlay_supplies`]),
+    /// so `main_src_files` lacks every embedded file.
+    embeds_unresolved: bool,
 }
 
 /// A filesystem-replaced sibling module (`replace foo => ./sib`). cmd/go
@@ -239,6 +249,8 @@ struct RawLocalPkg {
     is_cgo: bool,
     files: PkgFiles,
     main_src_files: Vec<String>,
+    embed_patterns: Vec<String>,
+    embeds_unresolved: bool,
 }
 
 /// Per-package source file lists as reported by `go list`, threaded through
@@ -335,6 +347,95 @@ fn main_src_files_from(p: &GoPackage) -> Vec<String> {
         out.extend(v.iter().cloned());
     }
     out.into_iter().collect()
+}
+
+/// Every //go:embed pattern of the package: build, test, and xtest.
+fn all_embed_patterns(p: &GoPackage) -> Vec<String> {
+    let mut out: BTreeSet<String> = BTreeSet::new();
+    out.extend(p.embed_patterns.iter().cloned());
+    out.extend(p.test_embed_patterns.iter().cloned());
+    out.extend(p.x_test_embed_patterns.iter().cloned());
+    out.into_iter().collect()
+}
+
+/// Whether nix/dag lays a `packageOverrides.<pkg>.srcOverlay` over the source
+/// of the package. It looks the package up by import path and falls back to
+/// the module path, so an import-path entry without srcOverlay shadows a
+/// module-path entry with one.
+fn overlay_supplies(
+    overlays: &BTreeMap<String, bool>,
+    import_path: &str,
+    module: Option<&GoModule>,
+) -> bool {
+    match overlays.get(import_path) {
+        Some(&has) => has,
+        None => module.is_some_and(|m| overlays.get(&m.path) == Some(&true)),
+    }
+}
+
+/// go list's wording (cmd/go/internal/load `EmbedError`) for a //go:embed
+/// pattern that matches no file, or only a directory with nothing it may
+/// embed: what a pattern reports when its files do not exist yet. Every other
+/// embed error (bad syntax, a file in another module, an irregular file) says
+/// something else and stays fatal.
+fn is_missing_embed_error(err: &str) -> bool {
+    let Some(rest) = err.strip_prefix("pattern ") else {
+        return false;
+    };
+    rest.ends_with(": no matching files found")
+        || (rest.contains(": cannot embed directory ")
+            && rest.ends_with(": contains no embeddable files"))
+}
+
+/// Dir-relative paths of the files under `dir` that `patterns` can embed: all
+/// files below the leading glob-free elements of each pattern (a superset of
+/// the matches), without entering another module. go list drops every
+/// embedded file of a package when one of its patterns matches nothing, so
+/// this stands in for the files the other patterns do match.
+fn embed_candidates(dir: &Path, patterns: &[String]) -> Result<BTreeSet<String>> {
+    fn walk(dir: &Path, rel: &str, out: &mut BTreeSet<String>) -> Result<()> {
+        let path = dir.join(rel);
+        let meta = match std::fs::symlink_metadata(&path) {
+            Ok(meta) => meta,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
+        };
+        if !meta.is_dir() {
+            out.insert(rel.to_owned());
+            return Ok(());
+        }
+        if !rel.is_empty() && path.join("go.mod").exists() {
+            return Ok(());
+        }
+        for entry in
+            std::fs::read_dir(&path).with_context(|| format!("reading {}", path.display()))?
+        {
+            let entry = entry.with_context(|| format!("reading {}", path.display()))?;
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            walk(
+                dir,
+                &if rel.is_empty() {
+                    name.into_owned()
+                } else {
+                    format!("{rel}/{name}")
+                },
+                out,
+            )?;
+        }
+        Ok(())
+    }
+    let mut out = BTreeSet::new();
+    for pattern in patterns {
+        let glob = pattern.strip_prefix("all:").unwrap_or(pattern);
+        let root = glob
+            .split('/')
+            .take_while(|e| !e.contains(['*', '?', '[', '\\']))
+            .collect::<Vec<_>>()
+            .join("/");
+        walk(dir, &root, &mut out)?;
+    }
+    Ok(out)
 }
 
 /// Cap on the sanitized component so the full derivation name (prefix +
@@ -476,7 +577,7 @@ fn run_go_list(
 ) -> Result<Vec<u8>> {
     let mut cmd = Command::new(go_bin);
     cmd.arg("list");
-    cmd.arg("-json=ImportPath,Dir,Module,Imports,GoFiles,CgoFiles,SFiles,CFiles,CXXFiles,MFiles,FFiles,HFiles,SysoFiles,SwigFiles,SwigCXXFiles,EmbedPatterns,EmbedFiles,TestGoFiles,XTestGoFiles,TestEmbedFiles,XTestEmbedFiles,CgoPkgConfig,CgoCFLAGS,CgoLDFLAGS,InvalidGoFiles,Error");
+    cmd.arg("-json=ImportPath,Dir,Module,Imports,GoFiles,CgoFiles,SFiles,CFiles,CXXFiles,MFiles,FFiles,HFiles,SysoFiles,SwigFiles,SwigCXXFiles,EmbedPatterns,EmbedFiles,TestGoFiles,XTestGoFiles,TestEmbedFiles,XTestEmbedFiles,TestEmbedPatterns,XTestEmbedPatterns,CgoPkgConfig,CgoCFLAGS,CgoLDFLAGS,InvalidGoFiles,Error");
     cmd.arg("-deps");
     cmd.arg("-e");
     cmd.arg("-buildvcs=false");
@@ -546,7 +647,7 @@ fn run_go_list_test(
 ) -> Result<Vec<u8>> {
     let mut cmd = Command::new(go_bin);
     cmd.arg("list");
-    cmd.arg("-json=ImportPath,Dir,Module,Imports,TestImports,XTestImports,GoFiles,CgoFiles,SFiles,CFiles,CXXFiles,MFiles,FFiles,HFiles,SysoFiles,SwigFiles,SwigCXXFiles,EmbedPatterns,EmbedFiles,TestGoFiles,XTestGoFiles,TestEmbedFiles,XTestEmbedFiles,CgoPkgConfig,CgoCFLAGS,CgoLDFLAGS,ForTest,Match,InvalidGoFiles,Error");
+    cmd.arg("-json=ImportPath,Dir,Module,Imports,TestImports,XTestImports,GoFiles,CgoFiles,SFiles,CFiles,CXXFiles,MFiles,FFiles,HFiles,SysoFiles,SwigFiles,SwigCXXFiles,EmbedPatterns,EmbedFiles,TestGoFiles,XTestGoFiles,TestEmbedFiles,XTestEmbedFiles,TestEmbedPatterns,XTestEmbedPatterns,CgoPkgConfig,CgoCFLAGS,CgoLDFLAGS,ForTest,Match,InvalidGoFiles,Error");
     cmd.arg("-deps");
     cmd.arg("-test");
     cmd.arg("-e");
@@ -589,6 +690,9 @@ struct TestPassResult {
     /// only resolves test embed files under `-test`, so the build pass left
     /// these empty; merged into local_packages[].main_src_files by the caller.
     local_test_embed_files: BTreeMap<String, Vec<String>>,
+    /// Build-graph locals whose test or xtest //go:embed patterns go list
+    /// could not resolve because their srcOverlay supplies the files.
+    local_embeds_unresolved: BTreeSet<String>,
 }
 
 fn parse_test_packages(
@@ -596,6 +700,7 @@ fn parse_test_packages(
     third_party_paths: &BTreeSet<String>,
     local_paths: &BTreeSet<String>,
     replacements: &mut BTreeMap<String, (String, String)>,
+    overlays: &BTreeMap<String, bool>,
 ) -> Result<TestPassResult> {
     classify_test_packages(
         serde_json::Deserializer::from_slice(stdout)
@@ -604,6 +709,7 @@ fn parse_test_packages(
         third_party_paths,
         local_paths,
         replacements,
+        overlays,
     )
 }
 
@@ -612,6 +718,7 @@ fn classify_test_packages(
     third_party_paths: &BTreeSet<String>,
     local_paths: &BTreeSet<String>,
     replacements: &mut BTreeMap<String, (String, String)>,
+    overlays: &BTreeMap<String, bool>,
 ) -> Result<TestPassResult> {
     let mut test_packages = Vec::new();
     let mut test_only_paths = BTreeSet::new();
@@ -624,26 +731,41 @@ fn classify_test_packages(
     // don't carry test imports.
     let mut local_test_imports: BTreeMap<String, Vec<String>> = BTreeMap::new();
     let mut pkg_errors = Vec::new();
+    // Local packages, build-graph or test-only, whose //go:embed patterns
+    // their srcOverlay is to satisfy (see classify_go_packages).
+    let mut embeds_unresolved: BTreeSet<String> = BTreeSet::new();
 
     for result in records {
         let jpkg = result?;
 
         if let Some(ref err) = jpkg.error {
             if !err.err.is_empty() {
-                // The `./...` patterns surface out-of-scope local packages
-                // (not in any subPackage's build closure). Their errors are
-                // not actionable here — only fail for packages already in
-                // the build graph or a test variant of one.
                 let bare = strip_variant_suffix(&jpkg.import_path);
-                // a "P.test" record can be the test main go generates for P (a real package may share the path);
-                // its errors can quote P's _test.go files, and 'go test' reports them itself
-                if !bare.ends_with(".test")
-                    && (local_paths.contains(bare)
-                        || (!jpkg.for_test.is_empty() && local_paths.contains(&jpkg.for_test)))
+                // An external test `P_test [P.test]` embeds from the
+                // directory of P, so the overlay of P supplies its files.
+                let owner = match bare.strip_suffix("_test") {
+                    Some(p) if p == jpkg.for_test => p,
+                    _ => bare,
+                };
+                if is_missing_embed_error(&err.err)
+                    && overlay_supplies(overlays, owner, jpkg.module.as_ref())
                 {
-                    pkg_errors.push(pkg_error_text(&jpkg, err));
+                    embeds_unresolved.insert(owner.to_owned());
+                } else {
+                    // The `./...` patterns surface out-of-scope local packages
+                    // (not in any subPackage's build closure). Their errors are
+                    // not actionable here — only fail for packages already in
+                    // the build graph or a test variant of one.
+                    // a "P.test" record can be the test main go generates for P (a real package may share the path);
+                    // its errors can quote P's _test.go files, and 'go test' reports them itself
+                    if !bare.ends_with(".test")
+                        && (local_paths.contains(bare)
+                            || (!jpkg.for_test.is_empty() && local_paths.contains(&jpkg.for_test)))
+                    {
+                        pkg_errors.push(pkg_error_text(&jpkg, err));
+                    }
+                    continue;
                 }
-                continue;
             }
         }
 
@@ -666,6 +788,7 @@ fn classify_test_packages(
 
         let files = pkg_files_from(&jpkg);
         let main_src_files = main_src_files_from(&jpkg);
+        let embed_patterns = all_embed_patterns(&jpkg);
 
         // Skip stdlib (no module).
         let Some(module) = jpkg.module else {
@@ -723,6 +846,9 @@ fn classify_test_packages(
                 .map(|i| strip_variant_suffix(i).to_owned())
                 .collect();
             raw_test_locals.push(RawLocalPkg {
+                embed_patterns,
+                // set below, once every record has been seen
+                embeds_unresolved: false,
                 import_path,
                 dir: jpkg.dir,
                 mod_path: module.path.clone(),
@@ -851,6 +977,7 @@ fn classify_test_packages(
                 }
             }
             LocalPkgData {
+                embeds_unresolved: embeds_unresolved.contains(&raw.import_path),
                 import_path: raw.import_path,
                 dir: raw.dir,
                 mod_path: raw.mod_path,
@@ -862,6 +989,7 @@ fn classify_test_packages(
                 is_cgo: raw.is_cgo,
                 files: raw.files,
                 main_src_files: raw.main_src_files,
+                embed_patterns: raw.embed_patterns,
             }
         })
         .collect();
@@ -870,6 +998,10 @@ fn classify_test_packages(
         test_packages,
         test_local_packages,
         local_test_embed_files,
+        local_embeds_unresolved: embeds_unresolved
+            .into_iter()
+            .filter(|p| local_paths.contains(p))
+            .collect(),
     })
 }
 
@@ -926,15 +1058,22 @@ impl PackageGraph {
     }
 }
 
-pub(crate) fn parse_go_packages(stdout: &[u8]) -> Result<PackageGraph> {
+pub(crate) fn parse_go_packages(
+    stdout: &[u8],
+    overlays: &BTreeMap<String, bool>,
+) -> Result<PackageGraph> {
     classify_go_packages(
         serde_json::Deserializer::from_slice(stdout)
             .into_iter::<GoPackage>()
             .map(|r| r.context("resolveGoPackages: failed to parse go list JSON")),
+        overlays,
     )
 }
 
-fn classify_go_packages(records: impl Iterator<Item = Result<GoPackage>>) -> Result<PackageGraph> {
+fn classify_go_packages(
+    records: impl Iterator<Item = Result<GoPackage>>,
+    overlays: &BTreeMap<String, bool>,
+) -> Result<PackageGraph> {
     let mut packages = Vec::new();
     let mut pkg_errors = Vec::new();
     let mut third_party_paths = BTreeSet::new();
@@ -949,15 +1088,27 @@ fn classify_go_packages(records: impl Iterator<Item = Result<GoPackage>>) -> Res
     for result in records {
         let jpkg = result?;
 
+        // go list still reports the files and imports of a package whose
+        // //go:embed patterns it cannot resolve; only the embedded files are
+        // missing. compile-package resolves the patterns again over the
+        // overlaid source and fails if the overlay lacks them.
+        let mut embeds_unresolved = false;
         if let Some(ref err) = jpkg.error {
             if !err.err.is_empty() {
-                pkg_errors.push(pkg_error_text(&jpkg, err));
-                continue;
+                if is_missing_embed_error(&err.err)
+                    && overlay_supplies(overlays, &jpkg.import_path, jpkg.module.as_ref())
+                {
+                    embeds_unresolved = true;
+                } else {
+                    pkg_errors.push(pkg_error_text(&jpkg, err));
+                    continue;
+                }
             }
         }
 
         let files = pkg_files_from(&jpkg);
         let main_src_files = main_src_files_from(&jpkg);
+        let embed_patterns = all_embed_patterns(&jpkg);
 
         // stdlib packages have no module
         let Some(module) = jpkg.module else {
@@ -996,6 +1147,8 @@ fn classify_go_packages(records: impl Iterator<Item = Result<GoPackage>>) -> Res
             local_paths.insert(jpkg.import_path.clone());
 
             raw_local_pkgs.push(RawLocalPkg {
+                embed_patterns,
+                embeds_unresolved,
                 import_path: jpkg.import_path,
                 dir: jpkg.dir,
                 mod_path: module.path.clone(),
@@ -1076,6 +1229,8 @@ fn classify_go_packages(records: impl Iterator<Item = Result<GoPackage>>) -> Res
                 is_cgo: raw.is_cgo,
                 files: raw.files,
                 main_src_files: raw.main_src_files,
+                embed_patterns: raw.embed_patterns,
+                embeds_unresolved: raw.embeds_unresolved,
             }
         })
         .collect();
@@ -1128,6 +1283,12 @@ pub(crate) struct JsonInput {
     /// Enables lockfile-free builds.
     #[serde(default)]
     pub(crate) resolve_hashes: bool,
+    /// Every `packageOverrides` key (an import path or a module path), mapped
+    /// to whether that entry sets `srcOverlay`. nix/dag looks a package up by
+    /// import path first and falls back to its module path; so does
+    /// [`overlay_supplies`].
+    #[serde(default)]
+    src_overlays: BTreeMap<String, bool>,
 }
 
 fn default_sub_packages() -> Vec<String> {
@@ -1207,7 +1368,7 @@ pub(crate) fn resolve_packages(input: &JsonInput) -> Result<PackageGraph> {
 /// and local.
 fn resolve_two_passes(go_bin: &str, input: &JsonInput, opts: &GoListOpts) -> Result<PackageGraph> {
     let stdout = run_go_list(go_bin, &input.src, &input.sub_packages, opts)?;
-    let mut graph = parse_go_packages(&stdout)?;
+    let mut graph = parse_go_packages(&stdout, &input.src_overlays)?;
 
     if input.do_check && !graph.local_packages.is_empty() {
         // Pass `./...` for the main module plus `<mod>/...` for each
@@ -1226,6 +1387,7 @@ fn resolve_two_passes(go_bin: &str, input: &JsonInput, opts: &GoListOpts) -> Res
             &graph.third_party_paths,
             &graph.local_paths,
             &mut graph.replacements,
+            &input.src_overlays,
         )?;
         merge_test_pass(&mut graph, tp);
     }
@@ -1248,6 +1410,7 @@ fn merge_test_pass(graph: &mut PackageGraph, tp: TestPassResult) {
     graph.test_packages = tp.test_packages;
     graph.test_local_packages = tp.test_local_packages;
     for lp in &mut graph.local_packages {
+        lp.embeds_unresolved |= tp.local_embeds_unresolved.contains(&lp.import_path);
         if let Some(extra) = tp.local_test_embed_files.get(&lp.import_path) {
             lp.main_src_files.extend(extra.iter().cloned());
             lp.main_src_files.sort();
@@ -1304,7 +1467,11 @@ fn resolve_single_pass(go_bin: &str, input: &JsonInput, opts: &GoListOpts) -> Op
         .ok()?;
 
     let build = build_closure(&records, &input.sub_packages)?;
-    let mut graph = classify_go_packages(build.into_iter().map(|i| Ok(records[i].clone()))).ok()?;
+    let mut graph = classify_go_packages(
+        build.into_iter().map(|i| Ok(records[i].clone())),
+        &input.src_overlays,
+    )
+    .ok()?;
     if graph.local_packages.is_empty() {
         return Some(graph);
     }
@@ -1324,6 +1491,7 @@ fn resolve_single_pass(go_bin: &str, input: &JsonInput, opts: &GoListOpts) -> Op
         &graph.third_party_paths,
         &graph.local_paths,
         &mut graph.replacements,
+        &input.src_overlays,
     )
     .ok()?;
     merge_test_pass(&mut graph, tp);
@@ -1827,10 +1995,13 @@ pub(crate) fn package_graph_to_json(
         } else {
             rel_str.into_owned()
         };
-        let main_src_files = lp
-            .main_src_files
-            .iter()
-            .map(|f| if dir == "." { f.clone() } else { format!("{dir}/{f}") })
+        let mut main_src_files: BTreeSet<String> = lp.main_src_files.iter().cloned().collect();
+        if lp.embeds_unresolved {
+            main_src_files.extend(embed_candidates(Path::new(&lp.dir), &lp.embed_patterns)?);
+        }
+        let main_src_files = main_src_files
+            .into_iter()
+            .map(|f| if dir == "." { f } else { format!("{dir}/{f}") })
             .collect();
         Ok((
             lp.import_path.clone(),
@@ -2028,7 +2199,7 @@ mod tests {
     #[test]
     fn parse_skips_stdlib() {
         let input = stdlib_json("fmt");
-        let graph = parse_go_packages(input.as_bytes()).unwrap();
+        let graph = parse_go_packages(input.as_bytes(), &BTreeMap::new()).unwrap();
         assert!(graph.packages.is_empty());
         assert!(graph.local_packages.is_empty());
     }
@@ -2036,7 +2207,7 @@ mod tests {
     #[test]
     fn parse_collects_third_party() {
         let input = third_party_json("github.com/foo/bar", "github.com/foo/bar", "v1.0.0");
-        let graph = parse_go_packages(input.as_bytes()).unwrap();
+        let graph = parse_go_packages(input.as_bytes(), &BTreeMap::new()).unwrap();
         assert_eq!(graph.packages.len(), 1);
         assert_eq!(graph.packages[0].import_path, "github.com/foo/bar");
         assert_eq!(graph.packages[0].mod_version, "v1.0.0");
@@ -2051,7 +2222,7 @@ mod tests {
             "/src/internal/db",
             &[],
         );
-        let graph = parse_go_packages(input.as_bytes()).unwrap();
+        let graph = parse_go_packages(input.as_bytes(), &BTreeMap::new()).unwrap();
         assert!(graph.packages.is_empty());
         assert_eq!(graph.local_packages.len(), 1);
         assert_eq!(
@@ -2077,7 +2248,7 @@ mod tests {
         ]
         .join("\n");
 
-        let graph = parse_go_packages(input.as_bytes()).unwrap();
+        let graph = parse_go_packages(input.as_bytes(), &BTreeMap::new()).unwrap();
         assert_eq!(graph.local_packages.len(), 2);
 
         let pkg_b = &graph.local_packages[1];
@@ -2098,7 +2269,7 @@ mod tests {
         ]
         .join("\n");
 
-        let graph = parse_go_packages(input.as_bytes()).unwrap();
+        let graph = parse_go_packages(input.as_bytes(), &BTreeMap::new()).unwrap();
         assert_eq!(graph.module_path, "example.com/mymod");
     }
 
@@ -2111,7 +2282,7 @@ mod tests {
             "github.com/new/pkg",
             "v2.0.0",
         );
-        let graph = parse_go_packages(input.as_bytes()).unwrap();
+        let graph = parse_go_packages(input.as_bytes(), &BTreeMap::new()).unwrap();
         assert_eq!(graph.packages.len(), 1);
         let (path, version) = &graph.replacements["github.com/old/pkg@v2.0.0"];
         assert_eq!(path, "github.com/new/pkg");
@@ -2131,7 +2302,7 @@ mod tests {
             "github.com/new/pkg",
             "v2.0.0",
         );
-        let graph = parse_go_packages(input.as_bytes()).unwrap();
+        let graph = parse_go_packages(input.as_bytes(), &BTreeMap::new()).unwrap();
 
         let mut hashes = BTreeMap::new();
         hashes.insert(
@@ -2152,6 +2323,7 @@ mod tests {
             go_proxy: None,
             cgo_enabled: String::new(),
             resolve_hashes: false,
+            src_overlays: BTreeMap::new(),
         };
         let json = package_graph_to_json(&graph, &input, hashes).unwrap();
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
@@ -2178,7 +2350,7 @@ mod tests {
         ]
         .join("\n");
 
-        let result = parse_go_packages(input.as_bytes());
+        let result = parse_go_packages(input.as_bytes(), &BTreeMap::new());
         let err = result.err().expect("should have errored");
         let msg = format!("{err}");
         assert!(msg.contains("github.com/bad/a: missing module"));
@@ -2207,7 +2379,12 @@ mod tests {
 {"ImportPath":"m/om","Dir":"/s/om","InvalidGoFiles":["open me.go"],"Error":{"ImportStack":["m","m/om"],"Pos":"deep/deep.go:6:8","Err":"open me.go: invalid #cgo verb: #cgo X"}}
 {"ImportPath":"m/n","Dir":"/s/n","InvalidGoFiles":["nul.go"],"Error":{"ImportStack":["m","m/n"],"Pos":"deep/deep.go:6:8","Err":"read /s/n/nul.go: unexpected NUL in input"}}
 {"ImportPath":"x.org/r","Error":{"ImportStack":["m"],"Pos":"main.go:6:8","Err":"module ../r: parsing ../r/go.mod: /s/r/go.mod:3: invalid go version 'SECRET': must match format 1.23.0\n/s/r/go.mod:4: usage: require module/path v1.2.3"}}"#;
-        let msg = format!("{}", parse_go_packages(input.as_bytes()).err().unwrap());
+        let msg = format!(
+            "{}",
+            parse_go_packages(input.as_bytes(), &BTreeMap::new())
+                .err()
+                .unwrap()
+        );
         assert!(!msg.contains("SECRET"), "{msg}");
         for want in [
             "- m: main.go:1:1 does not parse; run 'gofmt -e' on it to see why\n",
@@ -2254,7 +2431,7 @@ mod tests {
     #[test]
     fn parse_cgo_fields() {
         let input = r#"{"ImportPath":"github.com/cgo/pkg","Module":{"Path":"github.com/cgo/pkg","Version":"v1.0.0"},"Imports":[],"CgoFiles":["bridge.go"],"CgoPkgConfig":["libfoo"],"CgoCFLAGS":["-I/usr/include"],"CgoLDFLAGS":["-lfoo"]}"#;
-        let graph = parse_go_packages(input.as_bytes()).unwrap();
+        let graph = parse_go_packages(input.as_bytes(), &BTreeMap::new()).unwrap();
         assert!(graph.packages[0].is_cgo);
         assert_eq!(graph.packages[0].cgo_pkg_config, vec!["libfoo"]);
         assert_eq!(graph.packages[0].cgo_cflags, vec!["-I/usr/include"]);
@@ -2265,7 +2442,7 @@ mod tests {
     #[test]
     fn parse_file_lists_round_trip_to_json() {
         let input = r#"{"ImportPath":"github.com/f/p","Module":{"Path":"github.com/f/p","Version":"v1.0.0"},"Imports":[],"GoFiles":["a.go","b.go"],"CgoFiles":["c.go"],"SFiles":["asm.s"],"CFiles":["x.c"],"CXXFiles":["x.cc"],"MFiles":["x.m"],"FFiles":["x.f90"],"HFiles":["x.h"],"SysoFiles":["x.syso"],"SwigFiles":["x.swig"],"SwigCXXFiles":["x.swigcxx"],"EmbedPatterns":["data/*"]}"#;
-        let graph = parse_go_packages(input.as_bytes()).unwrap();
+        let graph = parse_go_packages(input.as_bytes(), &BTreeMap::new()).unwrap();
         let f = &graph.packages[0].files;
         assert_eq!(f.go_files, vec!["a.go", "b.go"]);
         assert_eq!(f.cgo_files, vec!["c.go"]);
@@ -2322,7 +2499,7 @@ mod tests {
     #[test]
     fn parse_local_file_lists() {
         let input = r#"{"ImportPath":"example.com/m","Dir":"/src","Module":{"Path":"example.com/m","Main":true},"Imports":[],"GoFiles":["main.go"],"SFiles":["asm_amd64.s"]}"#;
-        let graph = parse_go_packages(input.as_bytes()).unwrap();
+        let graph = parse_go_packages(input.as_bytes(), &BTreeMap::new()).unwrap();
         assert_eq!(graph.local_packages.len(), 1);
         let f = &graph.local_packages[0].files;
         assert_eq!(f.go_files, vec!["main.go"]);
@@ -2337,7 +2514,14 @@ mod tests {
         locals: &BTreeSet<String>,
     ) -> TestPassResult {
         let mut replacements = BTreeMap::new();
-        parse_test_packages(input.as_bytes(), third_party, locals, &mut replacements).unwrap()
+        parse_test_packages(
+            input.as_bytes(),
+            third_party,
+            locals,
+            &mut replacements,
+            &BTreeMap::new(),
+        )
+        .unwrap()
     }
 
     #[test]
@@ -2542,6 +2726,7 @@ mod tests {
             &BTreeSet::new(),
             &BTreeSet::new(),
             &mut replacements,
+            &BTreeMap::new(),
         )
         .unwrap();
         assert_eq!(r.test_packages.len(), 1);
@@ -2593,7 +2778,7 @@ mod tests {
     #[test]
     fn parse_captures_main_module_go_version() {
         let input = r#"{"ImportPath":"example.com/m","Dir":"/src","Module":{"Path":"example.com/m","Main":true,"GoVersion":"1.21.3"},"Imports":[],"GoFiles":["main.go"]}"#;
-        let graph = parse_go_packages(input.as_bytes()).unwrap();
+        let graph = parse_go_packages(input.as_bytes(), &BTreeMap::new()).unwrap();
         assert_eq!(graph.go_version, "1.21");
     }
 
@@ -2778,7 +2963,7 @@ mod tests {
             ),
             tp_with_imports("tp/c/pkg", "tp/c", "v3.0.0", &[], false),
         );
-        let graph = parse_go_packages(stdout.as_bytes()).unwrap();
+        let graph = parse_go_packages(stdout.as_bytes(), &BTreeMap::new()).unwrap();
         let tp_a = graph
             .packages
             .iter()
@@ -2876,7 +3061,7 @@ mod tests {
             &test_opts(Some("off")),
         )
         .unwrap();
-        let graph = parse_go_packages(&stdout).unwrap();
+        let graph = parse_go_packages(&stdout, &BTreeMap::new()).unwrap();
         let f = &graph.local_packages[0].files;
         assert_eq!(f.m_files, vec!["x.m"], "MFiles missing from go list output");
         assert_eq!(f.swig_files, vec!["x.swig"], "SwigFiles missing");
@@ -2895,7 +3080,10 @@ mod tests {
         std::fs::write(dir.path().join("p.go"), "package p\n").unwrap();
         std::fs::write(dir.path().join("bad.go"), "SECRET tokens\n").unwrap();
         let stdout = run_go_list(go, src, &["./...".into()], &test_opts(Some("off"))).unwrap();
-        let msg = parse_go_packages(&stdout).err().unwrap().to_string();
+        let msg = parse_go_packages(&stdout, &BTreeMap::new())
+            .err()
+            .unwrap()
+            .to_string();
         assert!(
             msg.contains("p.testkit: bad.go:1:1 does not parse;"),
             "{msg}"
@@ -2908,10 +3096,16 @@ mod tests {
         let local = ["example.com/p.testkit", "example.com/p.testkit.test"]
             .map(String::from)
             .into();
-        let msg = parse_test_packages(&stdout, &BTreeSet::new(), &local, &mut BTreeMap::new())
-            .err()
-            .unwrap()
-            .to_string();
+        let msg = parse_test_packages(
+            &stdout,
+            &BTreeSet::new(),
+            &local,
+            &mut BTreeMap::new(),
+            &BTreeMap::new(),
+        )
+        .err()
+        .unwrap()
+        .to_string();
         assert!(msg.contains("p_test.go:1:1 does not parse;"), "{msg}");
         assert!(!msg.contains("SECRET"), "{msg}");
     }
@@ -2945,7 +3139,7 @@ mod tests {
             tp_with_imports("tp/b/pkg", "tp/b", "v2.0.0", &[], true),
             tp_with_imports("tp/c/pkg", "tp/c", "v3.0.0", &[], false),
         );
-        let graph = parse_go_packages(stdout.as_bytes()).unwrap();
+        let graph = parse_go_packages(stdout.as_bytes(), &BTreeMap::new()).unwrap();
         let closures = compute_sub_package_closures(&graph, &["./cmd/a".into()]);
         let c = &closures["m/cmd/a"];
         assert_eq!(
@@ -2997,7 +3191,7 @@ mod tests {
             "{main}\n{sib}\n{}\n",
             tp_with_imports("tp/a/pkg", "tp/a", "v1.0.0", &[], false),
         );
-        let graph = parse_go_packages(stdout.as_bytes()).unwrap();
+        let graph = parse_go_packages(stdout.as_bytes(), &BTreeMap::new()).unwrap();
 
         // SiblingModule captured with require-version + sibling go-directive.
         assert_eq!(
@@ -3045,7 +3239,7 @@ mod tests {
             tp_with_imports("tp/a/pkg", "tp/a", "v1.0.0", &["github.com/x/B"], false),
             tp_with_imports("tp/c/pkg", "tp/c", "v3.0.0", &[], false),
         );
-        let graph = parse_go_packages(stdout.as_bytes()).unwrap();
+        let graph = parse_go_packages(stdout.as_bytes(), &BTreeMap::new()).unwrap();
         let closures = compute_sub_package_closures(&graph, &["./cmd/a".into()]);
         let c = &closures["m/cmd/a"];
         assert_eq!(c.mod_keys, vec!["tp/a@v1.0.0", "tp/c@v3.0.0"]);
@@ -3129,8 +3323,14 @@ mod tests {
 "#;
         let local_paths: BTreeSet<String> = ["example.com/sib".to_owned()].into();
         let mut replacements = BTreeMap::new();
-        let tp = parse_test_packages(stdout, &BTreeSet::new(), &local_paths, &mut replacements)
-            .unwrap();
+        let tp = parse_test_packages(
+            stdout,
+            &BTreeSet::new(),
+            &local_paths,
+            &mut replacements,
+            &BTreeMap::new(),
+        )
+        .unwrap();
         let got: Vec<_> = tp
             .test_local_packages
             .iter()
@@ -3621,6 +3821,134 @@ mod tests {
             assert_eq!(whole, two.clone().map(|_| ()), "{file}");
             assert!(two.unwrap_err().contains(wording), "{file}");
         }
+    }
+
+    /// Packages whose //go:embed targets a build step generates, supplied by packageOverrides.<pkg>.srcOverlay:
+    /// in `ui`, `all:dist` and `golden/*` (a test embed) match nothing in the tree go list reads, `templates/*`
+    /// does; in `web`, `static` holds only a placeholder, which a pattern without `all:` does not embed.
+    const OVERLAY_TREE: &[(&str, &str)] = &[
+        ("go.mod", "module example.com/m\n\ngo 1.21\n"),
+        (
+            "cmd/app/main.go",
+            "package main\n\nimport (\n\t\"example.com/m/ui\"\n\t\"example.com/m/web\"\n)\n\nfunc main() { println(ui.Name(), web.Name()) }\n",
+        ),
+        (
+            "web/web.go",
+            "package web\n\nimport \"embed\"\n\n//go:embed static\nvar FS embed.FS\n\nfunc Name() string { return \"web\" }\n",
+        ),
+        ("web/static/.keep", ""),
+        (
+            "ui/ui.go",
+            "package ui\n\nimport \"embed\"\n\n//go:embed all:dist templates/*\nvar FS embed.FS\n\nfunc Name() string { return \"ui\" }\n",
+        ),
+        (
+            "ui/ui_test.go",
+            "package ui\n\nimport (\n\t\"embed\"\n\t\"testing\"\n)\n\n//go:embed golden/*\nvar golden embed.FS\n\nfunc TestName(t *testing.T) { _ = golden }\n",
+        ),
+        ("ui/templates/index.html", "<p>hi</p>\n"),
+    ];
+
+    #[test]
+    fn embed_supplied_by_src_overlay() {
+        let Some(go) = DEFAULT_GO else {
+            eprintln!("skip: GO2NIX_DEFAULT_GO unset at build time");
+            return;
+        };
+        let dir = tempfile::tempdir().unwrap();
+        write_tree(dir.path(), OVERLAY_TREE);
+        let with = |overlays: serde_json::Value, do_check: bool| -> JsonInput {
+            let mut input = check_input(go, dir.path(), &["./cmd/app"]);
+            input.do_check = do_check;
+            input.src_overlays = serde_json::from_value(overlays).unwrap();
+            input
+        };
+        let resolve = |input: &JsonInput| {
+            resolve_packages(input)
+                .map(|g| package_graph_to_json(&g, input, BTreeMap::new()).unwrap())
+                .map_err(|e| format!("{e:#}"))
+        };
+
+        // keyed by import path or by module path; an import-path entry without srcOverlay shadows the module's
+        for overlays in [
+            serde_json::json!({}),
+            serde_json::json!({"example.com/m/ui": false, "example.com/m": true}),
+            serde_json::json!({"example.com/m/cmd/app": true}),
+        ] {
+            for do_check in [false, true] {
+                let err = resolve(&with(overlays.clone(), do_check)).unwrap_err();
+                assert!(
+                    err.contains("example.com/m/ui: pattern all:dist: no matching files found"),
+                    "{overlays} {do_check}: {err}"
+                );
+            }
+        }
+
+        for overlays in [
+            serde_json::json!({"example.com/m/ui": true, "example.com/m/web": true}),
+            serde_json::json!({"example.com/m": true}),
+        ] {
+            for do_check in [false, true] {
+                let input = with(overlays.clone(), do_check);
+                let json: serde_json::Value =
+                    serde_json::from_str(&resolve(&input).unwrap()).unwrap();
+                let ui = &json["localPackages"]["example.com/m/ui"];
+                assert_eq!(
+                    ui["files"]["goFiles"],
+                    serde_json::json!(["ui.go"]),
+                    "{overlays}"
+                );
+                assert_eq!(
+                    ui["files"]["embedPatterns"],
+                    serde_json::json!(["all:dist", "templates/*"]),
+                    "{overlays}"
+                );
+                // go list drops every embed file of the package once one pattern fails
+                assert_eq!(
+                    ui["mainSrcFiles"],
+                    serde_json::json!(["ui/templates/index.html", "ui/ui.go", "ui/ui_test.go"]),
+                    "{overlays} {do_check}"
+                );
+                assert_eq!(
+                    json["localPackages"]["example.com/m/web"]["mainSrcFiles"],
+                    serde_json::json!(["web/static/.keep", "web/web.go"]),
+                    "{overlays} {do_check}"
+                );
+                assert_eq!(
+                    json["localPackages"]["example.com/m/cmd/app"]["localImports"],
+                    serde_json::json!(["example.com/m/ui", "example.com/m/web"]),
+                    "{overlays}"
+                );
+                if do_check {
+                    let (two, one) = both_ways(go, &input);
+                    assert_eq!(one.as_ref(), Some(&two.unwrap()), "{overlays}");
+                }
+            }
+        }
+
+        // the overlay of one package does not excuse another's missing embed
+        write_tree(
+            dir.path(),
+            &[
+                (
+                    "cmd/app/lib.go",
+                    "package main\n\nimport _ \"example.com/m/lib\"\n",
+                ),
+                (
+                    "lib/lib.go",
+                    "package lib\n\nimport _ \"embed\"\n\n//go:embed version.txt\nvar Version string\n",
+                ),
+            ],
+        );
+        let err = resolve(&with(
+            serde_json::json!({"example.com/m/ui": true, "example.com/m/web": true}),
+            true,
+        ))
+        .unwrap_err();
+        assert!(
+            err.contains("example.com/m/lib: pattern version.txt: no matching files found"),
+            "{err}"
+        );
+        assert!(!err.contains("example.com/m/ui:"), "{err}");
     }
 
     /// With doCheck one `go list` process serves the call.

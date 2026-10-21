@@ -45,6 +45,10 @@ let
           src = ${go2nixSrc}/tests/fixtures/cgo-internal-test;
           goLock = ${go2nixSrc}/tests/fixtures/cgo-internal-test/go2nix.toml;
           inherit tags;
+          # internal/stamp embeds COMMIT, which only its srcOverlay has (see
+          # the fixture's dag.nix). Evaluation needs to know an overlay
+          # exists, not what is in it.
+          packageOverrides."example.com/cgo-internal-test/internal/stamp".srcOverlay = pkgs.emptyDirectory;
         };
       compileDrv =
         tags: pkg: (app tags).passthru.localPackages."example.com/cgo-internal-test/internal/''${pkg}".drvPath;

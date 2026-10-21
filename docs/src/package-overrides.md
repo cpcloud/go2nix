@@ -148,9 +148,22 @@ generated files. This is a build-time input of that one compile derivation
 only — it does **not** flow into `src` at evaluation time, so it does not
 trigger IFD and does not invalidate sibling packages.
 
-Keep a placeholder file in the source tree (e.g. `ui/dist/.gitkeep`) so
-the eval-time `go list` doesn't error on a `//go:embed` pattern with zero
-matches; the overlay then replaces or augments it at build time.
+The source tree needs no placeholder for the generated files. The
+eval-time `go list` reports a `//go:embed` pattern that matches nothing
+(`pattern all:dist: no matching files found`) as a package error; the
+plugin ignores that error for a package whose override sets `srcOverlay`
+and keeps the package's files and imports. `compile-package` resolves the
+patterns again over the overlaid source, so an overlay that lacks the files
+still fails the build. In any other package the error stays fatal at eval
+time.
+
+Once one pattern fails, `go list` reports none of the package's embedded
+files, not even checked-in matches of its other patterns. The plugin then
+adds every file under each pattern's leading glob-free directories to the
+application's link and test source, or the whole package directory when the
+first path element has a glob. A change to any of those files re-links the
+application and, under `doCheck`, re-runs its tests, even when no pattern
+matches the file.
 
 The `doCheck` testrunner applies the same overlay before resolving
 `//go:embed` patterns and recompiling for tests, so tests see the
