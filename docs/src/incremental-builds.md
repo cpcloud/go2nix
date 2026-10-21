@@ -104,7 +104,8 @@ The same reasoning for other kinds of change:
 | one module's version | its FOD, the packages of that module, everything that imports them, the importcfg bundle and the app |
 | a test-only dependency | its `testPackages` derivations, the test importcfg bundle and the app (relink, tests re-run) |
 | `ldflags`, `checkFlags` | the app only |
-| `tags`, `gcflags`, `pgoProfile` | every package compile (they are part of each compile manifest), then the bundle and the app. The stdlib is not affected |
+| `tags` | the packages whose file selection changes, the packages with cgo files (only their compile manifests carry the tags), everything that imports them, then the bundle and the app. Pure-Go packages with the same files keep their store paths. The stdlib is not affected |
+| `gcflags`, `pgoProfile` | every package compile (they are part of each compile manifest), then the bundle and the app. The stdlib is not affected |
 | the scope's `goEnv`, or the Go toolchain | the stdlib, and everything after it |
 
 To get a feel for how big the cone is in your project, see

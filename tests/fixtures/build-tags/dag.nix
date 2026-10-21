@@ -1,8 +1,8 @@
 # Test: default mode with custom build tags.
 #
 # internal/feature has //go:build mytag and //go:build !mytag twins.
-# tags = ["mytag"] must reach the eval-time `go list` (resolveGoPackages),
-# the per-package compile manifest, and modinfo (`build -tags=mytag`).
+# tags = ["mytag"] must reach the eval-time `go list` (resolveGoPackages)
+# and modinfo (`build -tags=mytag`).
 # The wrapper asserts the binary prints "on" — "off" would mean tags
 # were dropped somewhere in the chain.
 let
