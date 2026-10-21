@@ -3,7 +3,7 @@
 # packageOverrides.<pkg>.nativeBuildInputs.
 #
 # main.go is pure Go; internal/snap has a .cc shim calling snappy::Compress.
-# Exercises packageOverrides → resolvePkgConfig → compileCgo CXXFiles →
+# Exercises packageOverrides → pkgConfigFlags → compileCgo CXXFiles →
 # transitive cxx=true → linkbinary -extld $CXX → external linker against
 # libsnappy.so. cxx-cgo covers the same -extld step but with an in-tree .cc
 # only and no pkg-config / external .so.
