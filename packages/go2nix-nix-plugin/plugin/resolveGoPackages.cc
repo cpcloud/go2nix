@@ -161,7 +161,6 @@ static bool registerPrimOps() {
         return false;
     }
 
-    // Nix >=2.34 renamed PrimOp::fun to PrimOp::impl (see CMakeLists.txt).
     static RegisterPrimOp rp(PrimOp {
         .name = "resolveGoPackages",
         .args = {"attrs"},
@@ -200,11 +199,7 @@ static bool registerPrimOps() {
     testPackages, testLocalPackages (when doCheck=true and non-empty),
     moduleHashes (when resolveHashes=true) }
 )",
-#ifdef NIX_PRIMOP_HAS_IMPL
         .impl = prim_resolveGoPackages,
-#else
-        .fun = prim_resolveGoPackages,
-#endif
     });
 
     // Internal probe so nix/dag/default.nix can detect a skewed .so before
@@ -214,11 +209,7 @@ static bool registerPrimOps() {
         .args = {},
         .arity = 0,
         .doc = "Internal: contract version of the loaded go2nix-nix-plugin resolver.",
-#ifdef NIX_PRIMOP_HAS_IMPL
         .impl = prim_go2nixApiLevel,
-#else
-        .fun = prim_go2nixApiLevel,
-#endif
     });
 
     return true;
