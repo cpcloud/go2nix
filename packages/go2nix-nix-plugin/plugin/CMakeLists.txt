@@ -23,6 +23,11 @@ target_compile_options(go2nix_plugin PUBLIC ${NIX_CFLAGS_OTHER})
 if(NIX_PRIMOP_HAS_IMPL)
   target_compile_definitions(go2nix_plugin PRIVATE NIX_PRIMOP_HAS_IMPL)
 endif()
+
+# The plugin compares this with the evaluator's version when it loads.
+target_compile_definitions(go2nix_plugin PRIVATE
+  GO2NIX_BUILT_NIX_VERSION="${NIX_nix-expr_VERSION}")
+
 target_link_libraries(go2nix_plugin nlohmann_json::nlohmann_json)
 
 # Link the staticlib explicitly. The Rust crate emits both staticlib and
